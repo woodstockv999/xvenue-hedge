@@ -1,0 +1,26 @@
+# xvenue-hedge: txflow BTC × perpl BTC クロス会場デルタ中立farm(2026-07-23)
+# 狙い: txflowでBTCをfarm(将来pt)しつつperplで逆BTCをヘッジ=デルタ中立・両会場で二重farm。
+# 効率値(出来高÷損失)は本botの台帳(data/cycles.jsonl)で独立計測する。
+# ★dry_run/enabledは安全側の既定。実弾化は dry_run:false へ明示変更(dry_runで1サイクル完走確認後)。
+
+dry_run: true          # true=発注せず両会場の板から約定を模擬(構造+台帳の検証)
+enabled: true
+
+symbol: "BTC"          # 対象資産(両会場共通)。perpl BTC=market1(tick$0.1)、txflow BTC=coin1
+notional_usd: 30       # 1脚あたり想定notional(実弾はカナリア規模で小さく)
+hold_seconds: 120      # 建てて畳むまでの保有秒
+leg_timeout_seconds: 20 # ヘッジ脚(perpl)がmakerで刺さらなければtakerフォールバックする猶予
+cooldown_seconds: 10    # サイクル間クールダウン
+
+# perplは共有IPのCFレート制限(1015)がある。pair_hedgeと帯域を食い合うので控えめに。
+perpl_poll_seconds: 3
+
+loss_budget_usd: 20     # 台帳の累積net損失がこれを超えたら自己ハルト(発注停止)
+
+# 実測接地の手数料(bps)。txflow=cycles.jsonl逆算、perpl=exchange docstring。
+fees:
+  txflow_maker_bps: 1.5
+  txflow_taker_bps: 4.5
+  perpl_maker_bps: 0.9
+  perpl_taker_bps: 6.9
+  perpl_close_bps: 0.0   # reduce≈無料

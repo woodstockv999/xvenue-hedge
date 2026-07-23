@@ -126,6 +126,14 @@ class XVenueHedge:
         bids, asks = b["levels"][0], b["levels"][1]
         return float(bids[0]["px"]), float(asks[0]["px"])
 
+    def _tx_marketable_px(self, is_buy: bool, bid: float, ask: float) -> float:
+        """txflow taker IOC用の【確実約定価格】。touchちょうどだとBBO読取〜発注の間に板が
+        動くとIOCが刺さらない(2026-07-23 hedge_fail実測の真因)。クロス方向にバッファを足す。
+        IOCは板の最良値で約定する→バッファは約定保証のみで、板が動かなければtouch約定=コスト増なし。
+        client.quantize_priceがtick丸めするのでtick非整合でも安全。"""
+        b = float(self.cfg.get("taker_cross_bps", 8.0)) / 1e4
+        return ask * (1 + b) if is_buy else bid * (1 - b)
+
     def _perpl_bbo(self, force_fresh: bool = False):
         """perpl BBO。get_best_bid_askはキャッシュ無しで毎回REST get_context(CF保護)を叩く=429主因。
         短TTLキャッシュで requote/open/close の連続読みを1回のRESTに畳む(BTC BBOは数秒で不変)。
@@ -202,7 +210,7 @@ class XVenueHedge:
         if abs(pos) < 1e-8:
             return
         t_bid, t_ask = self._txflow_bbo()
-        px = t_bid if pos > 0 else t_ask  # long→sell@bid / short→buy@ask (marketable)
+        px = self._tx_marketable_px(pos < 0, t_bid, t_ask)  # long→sell/short→buy、確実約定バッファ付き
         try:
             self.tx.place_limit_order(self.symbol, pos < 0, px, abs(pos),
                                       reduce_only=True, tif=self.tx.TIF_IOC)
@@ -331,7 +339,7 @@ class XVenueHedge:
             pos = self._tx_position()
             if abs(pos) > 1e-8:
                 t_bid, t_ask = self._txflow_bbo()
-                px = t_bid if pos > 0 else t_ask
+                px = self._tx_marketable_px(pos < 0, t_bid, t_ask)  # 確実約定バッファ付き
                 self.tx.place_limit_order(self.symbol, pos < 0, px, abs(pos),
                                           reduce_only=True, tif=self.tx.TIF_IOC)
                 log(f"startup_reconcile: txflow {abs(pos)} をフラット化")
@@ -376,7 +384,8 @@ class XVenueHedge:
         # perpl脚が裸のまま(最大leg_timeout)=危険+完走率48%。txflow taker4.5bpsは安く1sで確実にヘッジ。
         tx_is_buy = dir_buy
         t_bid, t_ask = self._txflow_bbo()
-        tx_px = t_ask if tx_is_buy else t_bid       # marketable IOC(buy@ask/sell@bid)
+        tx_touch = t_ask if tx_is_buy else t_bid            # 約定はほぼtouch=台帳はこれで記録
+        tx_px = self._tx_marketable_px(tx_is_buy, t_bid, t_ask)  # 発注は板移動許容のバッファ付き
         tx_taker = True
         try:
             self.tx.place_limit_order(self.symbol, tx_is_buy, tx_px, size,
@@ -392,7 +401,7 @@ class XVenueHedge:
             #   dirtyを立て次ループ先頭で両会場flatten確認(_reconcile_dirty)して塞ぐ。
             self.dirty = True
             return {"skip": "hedge_failed_unwound"}
-        tx_fill = {"px": tx_px, "sz": abs(pos),
+        tx_fill = {"px": tx_touch, "sz": abs(pos),
                    "fee": self.notional * self.fees["txflow_taker_bps"] / 1e4}
 
         # === HOLD ===
@@ -417,10 +426,11 @@ class XVenueHedge:
                     pass
             pos = self._tx_position()
             if abs(pos) > 1e-8:
-                px = t_bid2 if pos > 0 else t_ask2
+                px = self._tx_marketable_px(pos < 0, t_bid2, t_ask2)  # long→sell/short→buy、確実約定
+                touch = t_bid2 if pos > 0 else t_ask2
                 self.tx.place_limit_order(self.symbol, pos < 0, px, abs(pos),
                                           reduce_only=True, tif=self.tx.TIF_IOC)
-                tx_cfill = {"px": px, "sz": abs(pos), "fee": self.notional * self.fees["txflow_taker_bps"] / 1e4}
+                tx_cfill = {"px": touch, "sz": abs(pos), "fee": self.notional * self.fees["txflow_taker_bps"] / 1e4}
             else:
                 tx_cfill = {"px": tx_cpx, "sz": size, "fee": 0.0}
         # perpl reduce-only close(reduce≈無料・確実)

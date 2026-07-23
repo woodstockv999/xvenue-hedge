@@ -16,7 +16,10 @@ cooldown_seconds: 30    # サイクル間クールダウン
 #   追従が taker落ちしても安い txflow(4.5bps)<perpl(6.9bps)。
 perpl_lead_timeout_seconds: 45   # perpl maker先行の猶予(長め=maker約定率↑)
 requote_interval_seconds: 12      # perpl maker が touch から外れたら置き直す間隔
-leg_timeout_seconds: 15          # txflow追従がmakerで刺さらなければtakerフォールバック
+leg_timeout_seconds: 15          # closeのtxflow makerが刺さらなければtakerフォールバックの猶予
+# 追従(hedge)は即taker(2026-07-23)。IOCがtouchちょうどだと板移動で刺さらずhedge_fail→
+# クロス方向に8bpsバッファ。IOCは板最良値で約定=バッファは約定保証のみでコスト増にならない。
+taker_cross_bps: 8.0
 # 改善③: perplは共有IPのCF 1015制限=pair_hedgeと帯域競合。poll間隔を空けて429緩和。
 poll_interval_seconds: 5          # fills RESTポーリング間隔。5s=45sリードで最大9回(旧3s=15回)
 

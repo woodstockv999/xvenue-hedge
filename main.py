@@ -371,44 +371,29 @@ class XVenueHedge:
         if not pp_filled:
             return {"skip": "perpl_lead_no_fill"}   # 建玉なし=安全に見送り
 
-        # perpl約定=裸perpl。txflow FOLLOWS(反対=dir_buy)で即ヘッジ。
+        # perpl約定=裸perpl。txflow FOLLOWS(反対=dir_buy)で【即takerヘッジ】(2026-07-23方針)。
+        # 旧: post_only maker待ち→timeoutでtaker。makerは0.03bps極薄板で刺さりにくく、待つ間
+        # perpl脚が裸のまま(最大leg_timeout)=危険+完走率48%。txflow taker4.5bpsは安く1sで確実にヘッジ。
         tx_is_buy = dir_buy
         t_bid, t_ask = self._txflow_bbo()
-        tx_px = t_bid if tx_is_buy else t_ask
-        ident = self._tx_place_maker(tx_is_buy, tx_px, size, reduce_only=False)
-        tx_fill, tx_taker = None, False
-        if ident is not None:
-            dl = time.time() + lt
-            while time.time() < dl:
-                tx_fill = self._tx_fill(ident, size)
-                if tx_fill:
-                    break
-                time.sleep(poll)
-        if not tx_fill:  # txflow takerで即ヘッジ(4.5bps<perpl6.9)
-            if isinstance(ident, int):
-                try:
-                    self.tx.cancel_order(self.symbol, ident)
-                except Exception:
-                    pass
-            pos = self._tx_position()
-            if abs(pos) < size * 0.5:               # 真に未約定→takerで建てる
-                t_bid, t_ask = self._txflow_bbo()
-                px = t_ask if tx_is_buy else t_bid   # marketable IOC
-                try:
-                    self.tx.place_limit_order(self.symbol, tx_is_buy, px, size,
-                                              reduce_only=False, tif=self.tx.TIF_IOC)
-                except Exception as e:
-                    log(f"⚠️ txflow追従taker失敗({repr(e)[:50]})")
-                tx_taker = True
-                time.sleep(1)
-                pos = self._tx_position()
-            if abs(pos) < size * 0.5:               # ヘッジ不成立→perpl脚unwind(裸回避)
-                log("⚠️ txflowヘッジ不成立→perpl脚をunwind(裸回避)")
-                self._perpl_unwind(perpl_is_buy, size)
-                return {"skip": "hedge_failed_unwound"}
-            tx_o_px = (t_ask if tx_is_buy else t_bid) if tx_taker else tx_px
-            fee_bps = self.fees["txflow_taker_bps"] if tx_taker else self.fees["txflow_maker_bps"]
-            tx_fill = {"px": tx_o_px, "sz": abs(pos), "fee": self.notional * fee_bps / 1e4}
+        tx_px = t_ask if tx_is_buy else t_bid       # marketable IOC(buy@ask/sell@bid)
+        tx_taker = True
+        try:
+            self.tx.place_limit_order(self.symbol, tx_is_buy, tx_px, size,
+                                      reduce_only=False, tif=self.tx.TIF_IOC)
+        except Exception as e:
+            log(f"⚠️ txflow追従taker失敗({repr(e)[:50]})")
+        time.sleep(1)
+        pos = self._tx_position()
+        if abs(pos) < size * 0.5:                   # ヘッジ不成立→perpl脚unwind(裸回避)
+            log("⚠️ txflowヘッジ不成立→perpl脚をunwind(裸回避)")
+            self._perpl_unwind(perpl_is_buy, size)
+            # ★txflow takerが約定していて建玉読みがラグると txflow が裸残になりうる。
+            #   dirtyを立て次ループ先頭で両会場flatten確認(_reconcile_dirty)して塞ぐ。
+            self.dirty = True
+            return {"skip": "hedge_failed_unwound"}
+        tx_fill = {"px": tx_px, "sz": abs(pos),
+                   "fee": self.notional * self.fees["txflow_taker_bps"] / 1e4}
 
         # === HOLD ===
         time.sleep(float(self.cfg["hold_seconds"]))

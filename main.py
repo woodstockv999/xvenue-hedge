@@ -392,8 +392,15 @@ class XVenueHedge:
                                       reduce_only=False, tif=self.tx.TIF_IOC)
         except Exception as e:
             log(f"⚠️ txflow追従taker失敗({repr(e)[:50]})")
-        time.sleep(1)
-        pos = self._tx_position()
+        pos = 0.0
+        for _ in range(6):                          # 建玉反映のラグ吸収(clearinghouseは数秒遅れる=偽hedge_fail防止)
+            time.sleep(0.5)
+            try:
+                pos = self._tx_position()
+            except Exception:
+                continue
+            if abs(pos) >= size * 0.5:
+                break
         if abs(pos) < size * 0.5:                   # ヘッジ不成立→perpl脚unwind(裸回避)
             log("⚠️ txflowヘッジ不成立→perpl脚をunwind(裸回避)")
             self._perpl_unwind(perpl_is_buy, size)
@@ -408,15 +415,29 @@ class XVenueHedge:
         time.sleep(float(self.cfg["hold_seconds"]))
 
         # === CLOSE: txflow reduce(maker→taker) + perpl reduce-only ===
-        t_bid2, t_ask2 = self._txflow_bbo()
         tx_close_buy = not tx_is_buy
+        crq = float(self.cfg.get("close_requote_seconds", 5))
+        t_bid2, t_ask2 = self._txflow_bbo()
         tx_cpx = t_bid2 if tx_close_buy else t_ask2
-        cid = self._tx_place_maker(tx_close_buy, tx_cpx, size, reduce_only=True)
-        tx_cfill, dl = None, time.time() + lt
-        while cid is not None and time.time() < dl:
+        tx_cfill, cid, last_place, dl = None, None, 0.0, time.time() + lt
+        while time.time() < dl:                        # closeもrequote(touch追随)でmaker取りこぼし改善
+            if cid is None:
+                t_bid2, t_ask2 = self._txflow_bbo()
+                tx_cpx = t_bid2 if tx_close_buy else t_ask2
+                cid = self._tx_place_maker(tx_close_buy, tx_cpx, size, reduce_only=True)
+                last_place = time.time()
+                if cid is None:                        # reduce_only拒否(既flat等)→taker/確認へ
+                    break
             tx_cfill = self._tx_fill(cid, size)
             if tx_cfill:
                 break
+            if time.time() - last_place >= crq:        # touch移動→置き直し(maker約定率↑=taker落ち減)
+                if isinstance(cid, int):
+                    try:
+                        self.tx.cancel_order(self.symbol, cid)
+                    except Exception:
+                        pass
+                cid = None
             time.sleep(poll)
         if not tx_cfill:  # taker強制close
             if isinstance(cid, int):

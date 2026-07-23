@@ -240,77 +240,140 @@ class XVenueHedge:
         }
 
     # ================= 実弾サイクル =================
-    def _run_cycle_live(self, dir_buy: bool) -> dict:
-        """txflow脚(farm)を先行約定させ、即perplでヘッジ(maker→leg_timeoutでtaker)。
-        裸窓=txflow約定→perplヘッジ約定。close時はperpl reduce-only。fail-closed。"""
-        lt = float(self.cfg["leg_timeout_seconds"])
-        t_bid, t_ask = self._txflow_bbo()
-        mid = (t_bid + t_ask) / 2
-        size = round(self.notional / mid, 5)  # BTC size_decimals=5
+    def _perpl_maker_lead(self, is_buy: bool, size: float):
+        """改善①②: perpl maker を先行させ requote しながら perpl_lead_timeout まで刺しにいく。
+        戻り(filled, fill_px)。未約定は(False,None)。建玉=正でfill確認(false-negative対策)。
+        改善③: fillはpoll_maker_fill主・get_position_sziはrequote/timeout時のみ=perpl call削減。"""
+        plt = float(self.cfg["perpl_lead_timeout_seconds"])
+        rq = float(self.cfg["requote_interval_seconds"])
+        poll = float(self.cfg["poll_interval_seconds"])
+        since_ms = int(time.time() * 1000)
+        deadline = time.time() + plt
+        oid, px, last_place = None, None, 0.0
+        while time.time() < deadline:
+            if oid is None:
+                p_bid, p_ask = self._perpl_bbo()
+                px = p_bid if is_buy else p_ask       # maker: buyはbid/sellはaskにjoin
+                oid = self.pp_exec.place_maker_resting(is_buy, size, px, reduce_only=False)
+                last_place = time.time()
+                if oid is None:
+                    time.sleep(poll)
+                    continue
+            if self.pp_exec.poll_maker_fill(oid, since_ms):
+                return True, px
+            if time.time() - last_place >= rq:       # requote: touchが動いてたら置き直す
+                if abs(self.pp_exec.get_position_szi()) >= size * 0.999:  # requote前に建玉=正で確認
+                    return True, px
+                p_bid, p_ask = self._perpl_bbo()
+                new_px = p_bid if is_buy else p_ask
+                if new_px != px:
+                    try:
+                        self.pp_exec.cancel_order(oid)
+                    except Exception:
+                        pass
+                    oid = None
+            time.sleep(poll)
+        if oid:
+            try:
+                self.pp_exec.cancel_order(oid)
+            except Exception:
+                pass
+        time.sleep(1)
+        if abs(self.pp_exec.get_position_szi()) >= size * 0.5:
+            return True, px                          # 建玉あり=約定してた(poll false-negative)
+        return False, None
 
-        # --- OPEN: txflow lead(farm) ---
+    def _perpl_unwind(self) -> None:
+        """perpl脚を建玉(=正)からreduce-onlyで即クローズ(ヘッジ失敗時の裸回避)。"""
+        szi = self.pp_exec.get_position_szi()
+        if abs(szi) < 1e-8:
+            return
+        try:
+            self.pp_exec.place_order(szi < 0, abs(szi), "unwind", reduce_only=True)
+            log(f"unwind: perpl {abs(szi)} を reduce-only close")
+        except Exception as e:
+            log(f"⚠️ perpl unwind失敗={repr(e)[:50]} 手動フラット化要")
+
+    def _startup_reconcile(self) -> None:
+        """起動時に両会場のBTCをフラット化(mid-cycle再起動での建玉残存/2倍化を防ぐ)。dry_runは無処理。"""
+        if self.dry_run:
+            return
+        self._perpl_unwind()  # perpl BTC
+        try:  # txflow BTC 注文取消
+            for o in (self.tx.get_open_orders(self.tx.main_address) or []):
+                if str(o.get("coin", "")).split("-")[0].upper() == self.symbol:
+                    self.tx.cancel_order(self.symbol, o.get("oid"))
+        except Exception:
+            pass
+        try:  # txflow BTC 建玉フラット
+            pos = self._tx_position()
+            if abs(pos) > 1e-8:
+                t_bid, t_ask = self._txflow_bbo()
+                px = t_bid if pos > 0 else t_ask
+                self.tx.place_limit_order(self.symbol, pos < 0, px, abs(pos),
+                                          reduce_only=True, tif=self.tx.TIF_IOC)
+                log(f"startup_reconcile: txflow {abs(pos)} をフラット化")
+        except Exception as e:
+            log(f"⚠️ startup_reconcile txflow失敗={repr(e)[:50]}")
+
+    def _run_cycle_live(self, dir_buy: bool) -> dict:
+        """改善①②③(2026-07-23): perpl maker を先行(patient+requote)、txflow を追従(maker→taker)。
+        perpl maker率↑・追従taker落ちしても安いtxflow(4.5)<perpl(6.9)。close時perpl reduce-only。fail-closed。
+        (旧: txflow先行→perpl追従はperpl taker落ち76%)。"""
+        lt = float(self.cfg["leg_timeout_seconds"])
+        poll = float(self.cfg["poll_interval_seconds"])
+        t_bid, t_ask = self._txflow_bbo()
+        size = round(self.notional / ((t_bid + t_ask) / 2), 5)  # BTC size_decimals=5
+
+        # === OPEN: perpl maker LEAD(patient+requote) ===
+        perpl_is_buy = not dir_buy
+        pp_filled, pp_open_px = self._perpl_maker_lead(perpl_is_buy, size)
+        if not pp_filled:
+            return {"skip": "perpl_lead_no_fill"}   # 建玉なし=安全に見送り
+
+        # perpl約定=裸perpl。txflow FOLLOWS(反対=dir_buy)で即ヘッジ。
         tx_is_buy = dir_buy
-        tx_px = t_bid if dir_buy else t_ask
+        t_bid, t_ask = self._txflow_bbo()
+        tx_px = t_bid if tx_is_buy else t_ask
         ident = self._tx_place_maker(tx_is_buy, tx_px, size, reduce_only=False)
-        if ident is None:
-            return {"skip": "txflow_place_failed"}
-        tx_fill, dl = None, time.time() + lt
-        while time.time() < dl:
-            tx_fill = self._tx_fill(ident, size)
-            if tx_fill:
-                break
-            time.sleep(1)
-        if not tx_fill:
+        tx_fill, tx_taker = None, False
+        if ident is not None:
+            dl = time.time() + lt
+            while time.time() < dl:
+                tx_fill = self._tx_fill(ident, size)
+                if tx_fill:
+                    break
+                time.sleep(poll)
+        if not tx_fill:  # txflow takerで即ヘッジ(4.5bps<perpl6.9)
             if isinstance(ident, int):
                 try:
                     self.tx.cancel_order(self.symbol, ident)
                 except Exception:
                     pass
-            time.sleep(1)
-            pos = self._tx_position()  # 建玉=正(fillポーリングのfalse-negative対策)
-            if abs(pos) < size * 0.5:
-                return {"skip": "txflow_no_fill"}  # 真に未約定=安全に見送り
-            tx_fill = {"px": mid, "sz": abs(pos), "fee": self.notional * self.fees["txflow_maker_bps"] / 1e4}
-        # txflow約定=裸BTC。即perplでヘッジ(反対側)。
-        p_bid, p_ask = self._perpl_bbo()
-        pp_is_buy = not dir_buy
-        pp_px = p_bid if pp_is_buy else p_ask     # maker: buyはbid/sellはaskにjoin
-        since_ms = int(time.time() * 1000)
-        pp_oid = self.pp_exec.place_maker_resting(pp_is_buy, size, pp_px, reduce_only=False)
-        pp_filled, pp_taker = False, False
-        if pp_oid:
-            dl = time.time() + lt
-            while time.time() < dl:
-                if self.pp_exec.poll_maker_fill(pp_oid, since_ms) or abs(self.pp_exec.get_position_szi()) >= size * 0.999:
-                    pp_filled = True
-                    break
-                time.sleep(1)
-        if not pp_filled:  # takerフォールバックで裸窓を閉じる(6.9bps)
-            if pp_oid:
+            pos = self._tx_position()
+            if abs(pos) < size * 0.5:               # 真に未約定→takerで建てる
+                t_bid, t_ask = self._txflow_bbo()
+                px = t_ask if tx_is_buy else t_bid   # marketable IOC
                 try:
-                    self.pp_exec.cancel_order(pp_oid)
-                except Exception:
-                    pass
-            pp_taker_px = None
-            try:
-                r = self.pp_exec.place_order(pp_is_buy, size, "hedge_taker_fallback", reduce_only=False)
-                if isinstance(r, dict) and r.get("price"):
-                    pp_taker_px = float(r["price"])
-            except Exception as e:
-                log(f"⚠️ perplヘッジtaker失敗({repr(e)[:50]})")
-            # ヘッジ成立を建玉で確認(=正)。不成立ならtxflow脚を即unwindして裸を解消(fail-closed)
-            if abs(self.pp_exec.get_position_szi()) < size * 0.5:
-                log("⚠️ perplヘッジ不成立→txflow脚をunwind(裸回避)")
-                self._tx_unwind(tx_is_buy, size)
+                    self.tx.place_limit_order(self.symbol, tx_is_buy, px, size,
+                                              reduce_only=False, tif=self.tx.TIF_IOC)
+                except Exception as e:
+                    log(f"⚠️ txflow追従taker失敗({repr(e)[:50]})")
+                tx_taker = True
+                time.sleep(1)
+                pos = self._tx_position()
+            if abs(pos) < size * 0.5:               # ヘッジ不成立→perpl脚unwind(裸回避)
+                log("⚠️ txflowヘッジ不成立→perpl脚をunwind(裸回避)")
+                self._perpl_unwind()
                 return {"skip": "hedge_failed_unwound"}
-            pp_taker = True
-        pp_open_px = (pp_px if pp_filled
-                      else (pp_taker_px if pp_taker_px is not None else (p_bid if pp_is_buy else p_ask)))
+            tx_o_px = (t_ask if tx_is_buy else t_bid) if tx_taker else tx_px
+            fee_bps = self.fees["txflow_taker_bps"] if tx_taker else self.fees["txflow_maker_bps"]
+            tx_fill = {"px": tx_o_px, "sz": abs(pos), "fee": self.notional * fee_bps / 1e4}
 
-        # --- HOLD ---
+        # === HOLD ===
         time.sleep(float(self.cfg["hold_seconds"]))
 
-        # --- CLOSE: txflow reduce(maker→taker) + perpl reduce-only ---
+        # === CLOSE: txflow reduce(maker→taker) + perpl reduce-only ===
         t_bid2, t_ask2 = self._txflow_bbo()
         tx_close_buy = not tx_is_buy
         tx_cpx = t_bid2 if tx_close_buy else t_ask2
@@ -320,7 +383,7 @@ class XVenueHedge:
             tx_cfill = self._tx_fill(cid, size)
             if tx_cfill:
                 break
-            time.sleep(1)
+            time.sleep(poll)
         if not tx_cfill:  # taker強制close
             if isinstance(cid, int):
                 try:
@@ -329,7 +392,7 @@ class XVenueHedge:
                     pass
             pos = self._tx_position()
             if abs(pos) > 1e-8:
-                px = t_bid2 if pos > 0 else t_ask2  # marketable IOC
+                px = t_bid2 if pos > 0 else t_ask2
                 self.tx.place_limit_order(self.symbol, pos < 0, px, abs(pos),
                                           reduce_only=True, tif=self.tx.TIF_IOC)
                 tx_cfill = {"px": px, "sz": abs(pos), "fee": self.notional * self.fees["txflow_taker_bps"] / 1e4}
@@ -337,30 +400,28 @@ class XVenueHedge:
                 tx_cfill = {"px": tx_cpx, "sz": size, "fee": 0.0}
         # perpl reduce-only close(reduce≈無料・確実)
         pp_szi = self.pp_exec.get_position_szi()
+        p_bid, p_ask = self._perpl_bbo()
         pp_close_px = (p_bid + p_ask) / 2
         if abs(pp_szi) > 1e-8:
             r = self.pp_exec.place_order(pp_szi < 0, abs(pp_szi), "close", reduce_only=True)
             if isinstance(r, dict) and r.get("price"):
                 pp_close_px = float(r["price"])
 
-        # --- 損益(実約定価格ベース) ---
+        # === 損益(long=close-open / short=open-close) ===
         tx_o, tx_c = tx_fill["px"], tx_cfill["px"]
-        # long(buy)は close-open、short(sell)は open-close で利益
         tx_pnl = (tx_c - tx_o) * size if tx_is_buy else (tx_o - tx_c) * size
-        pp_pnl = (pp_close_px - pp_open_px) * size if pp_is_buy else (pp_open_px - pp_close_px) * size
+        pp_pnl = (pp_close_px - pp_open_px) * size if perpl_is_buy else (pp_open_px - pp_close_px) * size
         tx_fee = tx_fill.get("fee", 0) + tx_cfill.get("fee", 0)
-        pp_fee = self.notional * ((self.fees["perpl_taker_bps"] if pp_taker else self.fees["perpl_maker_bps"])
-                                  + self.fees["perpl_close_bps"]) / 1e4
+        pp_fee = self.notional * (self.fees["perpl_maker_bps"] + self.fees["perpl_close_bps"]) / 1e4  # lead=常にmaker
         fees = tx_fee + pp_fee
-        volume = self.notional * 2 * 2
         net = tx_pnl + pp_pnl - fees
         return {
             "ts": round(time.time(), 3), "dir_buy": dir_buy, "dry_run": False,
             "size": size, "notional_usd": self.notional,
-            "txflow": {"open": tx_o, "close": tx_c, "pnl": round(tx_pnl, 5)},
+            "txflow": {"open": tx_o, "close": tx_c, "pnl": round(tx_pnl, 5), "taker_follow": tx_taker},
             "perpl": {"open": round(pp_open_px, 1), "close": round(pp_close_px, 1),
-                      "pnl": round(pp_pnl, 5), "taker_hedge": pp_taker},
-            "fees_usd": round(fees, 6), "volume_usd": round(volume, 4), "net_usd": round(net, 6),
+                      "pnl": round(pp_pnl, 5), "taker_hedge": False},
+            "fees_usd": round(fees, 6), "volume_usd": round(self.notional * 4, 4), "net_usd": round(net, 6),
         }
 
     def _record(self, rec: dict) -> None:
@@ -384,6 +445,7 @@ class XVenueHedge:
     def loop(self) -> None:
         log(f"xvenue-hedge 起動: dry_run={self.dry_run} notional=${self.notional} "
             f"(累積 cycles={self.cycles} net=${self.cum_net:+.3f})")
+        self._startup_reconcile()  # 起動時に両会場BTCフラット(再起動での建玉残存防止)
         dir_buy = True
         while self.cfg.get("enabled", True):
             if self.cum_net <= -float(self.cfg["loss_budget_usd"]):

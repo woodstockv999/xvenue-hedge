@@ -9,11 +9,16 @@ enabled: true
 symbol: "BTC"          # 対象資産(両会場共通)。perpl BTC=market1(tick$0.1)、txflow BTC=coin1
 notional_usd: 30       # 1脚あたり想定notional(実弾はカナリア規模で小さく)
 hold_seconds: 120      # 建てて畳むまでの保有秒
-leg_timeout_seconds: 20 # ヘッジ脚(perpl)がmakerで刺さらなければtakerフォールバックする猶予
 cooldown_seconds: 10    # サイクル間クールダウン
 
-# perplは共有IPのCFレート制限(1015)がある。pair_hedgeと帯域を食い合うので控えめに。
-perpl_poll_seconds: 3
+# 改善①②(2026-07-23): perpl maker を先行(lead)させ patient に刺す + txflow を追従(follow)。
+#   旧構成(txflow先行→perpl追従)は perpl taker落ち76%だった。逆転で perpl maker率↑、
+#   追従が taker落ちしても安い txflow(4.5bps)<perpl(6.9bps)。
+perpl_lead_timeout_seconds: 45   # perpl maker先行の猶予(長め=maker約定率↑)
+requote_interval_seconds: 8      # perpl maker が touch から外れたら置き直す間隔
+leg_timeout_seconds: 15          # txflow追従がmakerで刺さらなければtakerフォールバック
+# 改善③: perplは共有IPのCF 1015制限=pair_hedgeと帯域競合。poll間隔を空けて429緩和。
+poll_interval_seconds: 2
 
 loss_budget_usd: 20     # 台帳の累積net損失がこれを超えたら自己ハルト(発注停止)
 

@@ -283,14 +283,14 @@ class XVenueHedge:
             return True, px                          # 建玉あり=約定してた(poll false-negative)
         return False, None
 
-    def _perpl_unwind(self) -> None:
-        """perpl脚を建玉(=正)からreduce-onlyで即クローズ(ヘッジ失敗時の裸回避)。"""
-        szi = self.pp_exec.get_position_szi()
-        if abs(szi) < 1e-8:
-            return
+    def _perpl_unwind(self, was_buy: bool, size: float) -> None:
+        """perpl脚(was_buy方向で建った)をreduce-onlyで反対に即クローズ(ヘッジ失敗時の裸回避)。
+        ★get_position_sziは429でfail-open→0になり安全チェックが崩れるため使わない。
+        reduce-onlyは「建玉方向にしか約定しない=flatならno-op/reject」なので、szi読めなくても
+        安全に畳みにいける(fail-closed)。"""
         try:
-            self.pp_exec.place_order(szi < 0, abs(szi), "unwind", reduce_only=True)
-            log(f"unwind: perpl {abs(szi)} を reduce-only close")
+            self.pp_exec.place_order(not was_buy, size, "unwind", reduce_only=True)
+            log(f"unwind: perpl reduce-only close(was_buy={was_buy} size={size})")
         except Exception as e:
             log(f"⚠️ perpl unwind失敗={repr(e)[:50]} 手動フラット化要")
 
@@ -298,7 +298,16 @@ class XVenueHedge:
         """起動時に両会場のBTCをフラット化(mid-cycle再起動での建玉残存/2倍化を防ぐ)。dry_runは無処理。"""
         if self.dry_run:
             return
-        self._perpl_unwind()  # perpl BTC
+        # perpl BTC: 生の建玉(fail-openしない)を読んで方向付きで畳む
+        try:
+            pos = self.pp_exec._fetch_position()
+            if pos is not None:
+                from perpl_exchange import scaled_to_size
+                sz = scaled_to_size(int(pos["s"]), self.pp_market.size_decimals)
+                if sz > 1e-8:
+                    self._perpl_unwind(pos.get("sd") == 1, sz)  # sd==1(long)→sellで畳む
+        except Exception as e:
+            log(f"⚠️ startup_reconcile perpl建玉確認失敗={repr(e)[:50]}")
         try:  # txflow BTC 注文取消
             for o in (self.tx.get_open_orders(self.tx.main_address) or []):
                 if str(o.get("coin", "")).split("-")[0].upper() == self.symbol:
@@ -364,7 +373,7 @@ class XVenueHedge:
                 pos = self._tx_position()
             if abs(pos) < size * 0.5:               # ヘッジ不成立→perpl脚unwind(裸回避)
                 log("⚠️ txflowヘッジ不成立→perpl脚をunwind(裸回避)")
-                self._perpl_unwind()
+                self._perpl_unwind(perpl_is_buy, size)
                 return {"skip": "hedge_failed_unwound"}
             tx_o_px = (t_ask if tx_is_buy else t_bid) if tx_taker else tx_px
             fee_bps = self.fees["txflow_taker_bps"] if tx_taker else self.fees["txflow_maker_bps"]

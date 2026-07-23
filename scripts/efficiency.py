@@ -80,16 +80,15 @@ def build_report() -> str:
     ph = _acc(_read(PAIR_HEDGE_CYCLES, keep=lambda r: r.get("seq_lead") == "perpl:SOL"))
     xv_rows = _read(XVENUE_CYCLES, keep=lambda r: r.get("dry_run") is False)
     xv = _acc(xv_rows)
-    txb = _acc(_read(TXFLOW_BOT_CYCLES), net_key="net_pnl_usd")
 
     # --- 会場別(xvenueを按分して合流) ---
+    # ★txflow-bot(ARB/HBAR)は2026-07-23退役。txflow会場は稼働中のxvenue txflow脚のみ集計する
+    #   (退役した過去のARB/HBAR損失は前向き指標から外す。履歴は data/cycles.jsonl に残存)。
     xvv = _xvenue_by_venue(xv_rows)
     perpl_venue = {"n": ph["n"] + xvv["perpl"]["n"],
                    "volume": ph["volume"] + xvv["perpl"]["volume"],
                    "net": ph["net"] + xvv["perpl"]["net"], "fees": ph["fees"]}
-    txflow_venue = {"n": txb["n"] + xvv["txflow"]["n"],
-                    "volume": txb["volume"] + xvv["txflow"]["volume"],
-                    "net": txb["net"] + xvv["txflow"]["net"], "fees": txb["fees"]}
+    txflow_venue = dict(xvv["txflow"], fees=0.0)
 
     return (
         "【戦略別】\n"
@@ -97,7 +96,7 @@ def build_report() -> str:
         + _eff_line("xvenue-hedge", "txflow×perpl BTC", xv) + "\n\n"
         "【会場別】(xvenueは損益を出来高で按分)\n"
         + _eff_line("perpl", "pair_hedge + xvenue perpl脚", perpl_venue) + "\n"
-        + _eff_line("txflow", "txflow-bot + xvenue txflow脚", txflow_venue)
+        + _eff_line("txflow", "xvenue txflow脚(txflow-bot退役)", txflow_venue)
     )
 
 

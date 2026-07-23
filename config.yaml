@@ -7,7 +7,7 @@ dry_run: false          # true=発注せず両会場の板から約定を模擬(
 enabled: true
 
 symbol: "BTC"          # 対象資産(両会場共通)。perpl BTC=market1(tick$0.1)、txflow BTC=coin1
-notional_usd: 30       # 1脚あたり想定notional(実弾はカナリア規模で小さく)
+notional_usd: 60       # 1脚あたり想定notional。perpl balance$139/txflow$110・pair_hedge共有でも余裕(3x=証拠金$20)
 hold_seconds: 120      # 建てて畳むまでの保有秒
 cooldown_seconds: 30    # サイクル間クールダウン
 
@@ -18,7 +18,13 @@ perpl_lead_timeout_seconds: 45   # perpl maker先行の猶予(長め=maker約定
 requote_interval_seconds: 12      # perpl maker が touch から外れたら置き直す間隔
 leg_timeout_seconds: 15          # txflow追従がmakerで刺さらなければtakerフォールバック
 # 改善③: perplは共有IPのCF 1015制限=pair_hedgeと帯域競合。poll間隔を空けて429緩和。
-poll_interval_seconds: 3
+poll_interval_seconds: 5          # fills RESTポーリング間隔。5s=45sリードで最大9回(旧3s=15回)
+
+# 429緩和(2026-07-23): BBOはget_context(CF保護REST)を毎回叩く→短TTLキャッシュで畳む。
+perpl_bbo_ttl_seconds: 2.0
+# CF 1015(IPレート制限)検出時は即再突入せずエスカレート待機(バンを延ばさない)。clean cycleで解除。
+rl_backoff_base_seconds: 30
+rl_backoff_cap_seconds: 240
 
 loss_budget_usd: 20     # 台帳の累積net損失がこれを超えたら自己ハルト(発注停止)
 

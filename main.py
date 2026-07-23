@@ -102,6 +102,9 @@ class XVenueHedge:
         self.cycles = 0
         self.halted = False
         self.dirty = False  # cycle例外後の未フラット疑い。両会場flat確認まで新規サイクルを止める
+        self._pp_bbo_cache = None                       # (monotonic時刻, (bid,ask)) 429緩和のBBO短TTL
+        self._pp_bbo_ttl = float(cfg.get("perpl_bbo_ttl_seconds", 2.0))
+        self._rl_backoff = 0.0                          # perpl 429時のエスカレート待機(clean cycleで0へ)
         self._load_ledger()
 
     def _load_ledger(self) -> None:
@@ -123,8 +126,18 @@ class XVenueHedge:
         bids, asks = b["levels"][0], b["levels"][1]
         return float(bids[0]["px"]), float(asks[0]["px"])
 
-    def _perpl_bbo(self):
-        return self.pp_market.get_best_bid_ask()  # (bid, ask)
+    def _perpl_bbo(self, force_fresh: bool = False):
+        """perpl BBO。get_best_bid_askはキャッシュ無しで毎回REST get_context(CF保護)を叩く=429主因。
+        短TTLキャッシュで requote/open/close の連続読みを1回のRESTに畳む(BTC BBOは数秒で不変)。
+        force_fresh=True で必ず取り直す(requoteのtouch移動判定など鮮度が要る所)。"""
+        now = time.monotonic()
+        if not force_fresh and self._pp_bbo_cache is not None:
+            ts, val = self._pp_bbo_cache
+            if now - ts < self._pp_bbo_ttl:
+                return val
+        val = self.pp_market.get_best_bid_ask()  # (bid, ask)
+        self._pp_bbo_cache = (now, val)
+        return val
 
     # ================= 実弾: txflow脚(farm) =================
     def _tx_place_maker(self, is_buy: bool, price: float, size: float, reduce_only: bool):
@@ -501,6 +514,16 @@ class XVenueHedge:
                     if not self.dry_run and self.cfg.get("canary_once", False):
                         log("canary_once: 1サイクル完了。停止(建玉フラット確認のこと)。")
                         return
+                self._rl_backoff = 0.0                   # clean cycle=429バックオフ解除
+            except _pc.PerplRateLimitError as e:
+                # CF 1015はIPレート制限=即再突入するとバンを延ばす。エスカレート待機で叩くのを止める。
+                self.dirty = True                        # 途中でperpl脚が建った疑い→次ループでflatten
+                base = float(self.cfg.get("rl_backoff_base_seconds", 30))
+                cap = float(self.cfg.get("rl_backoff_cap_seconds", 240))
+                self._rl_backoff = min(cap, base if self._rl_backoff <= 0 else self._rl_backoff * 2)
+                log(f"perpl 429=CFレート制限。{self._rl_backoff:.0f}s バックオフ(叩くのを止める): {repr(e)[:80]}")
+                time.sleep(self._rl_backoff)
+                continue
             except Exception as e:
                 # 例外はcycle途中(perpl脚約定後など)で起きうる=裸脚の疑い。
                 # dirtyを立て、次ループ先頭で両会場フラット化してから再開する。

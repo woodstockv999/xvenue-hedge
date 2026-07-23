@@ -3,7 +3,7 @@
 # 効率値(出来高÷損失)は本botの台帳(data/cycles.jsonl)で独立計測する。
 # ★dry_run/enabledは安全側の既定。実弾化は dry_run:false へ明示変更(dry_runで1サイクル完走確認後)。
 
-dry_run: true          # true=発注せず両会場の板から約定を模擬(構造+台帳の検証)
+dry_run: false          # true=発注せず両会場の板から約定を模擬(構造+台帳の検証)
 enabled: true
 
 symbol: "BTC"          # 対象資産(両会場共通)。perpl BTC=market1(tick$0.1)、txflow BTC=coin1

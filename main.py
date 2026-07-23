@@ -291,8 +291,11 @@ class XVenueHedge:
                     self.pp_exec.cancel_order(pp_oid)
                 except Exception:
                     pass
+            pp_taker_px = None
             try:
-                self.pp_exec.place_order(pp_is_buy, size, "hedge_taker_fallback", reduce_only=False)
+                r = self.pp_exec.place_order(pp_is_buy, size, "hedge_taker_fallback", reduce_only=False)
+                if isinstance(r, dict) and r.get("price"):
+                    pp_taker_px = float(r["price"])
             except Exception as e:
                 log(f"⚠️ perplヘッジtaker失敗({repr(e)[:50]})")
             # ヘッジ成立を建玉で確認(=正)。不成立ならtxflow脚を即unwindして裸を解消(fail-closed)
@@ -301,7 +304,8 @@ class XVenueHedge:
                 self._tx_unwind(tx_is_buy, size)
                 return {"skip": "hedge_failed_unwound"}
             pp_taker = True
-        pp_open_px = pp_px if pp_filled else (p_bid if pp_is_buy else p_ask)
+        pp_open_px = (pp_px if pp_filled
+                      else (pp_taker_px if pp_taker_px is not None else (p_bid if pp_is_buy else p_ask)))
 
         # --- HOLD ---
         time.sleep(float(self.cfg["hold_seconds"]))
@@ -341,8 +345,9 @@ class XVenueHedge:
 
         # --- 損益(実約定価格ベース) ---
         tx_o, tx_c = tx_fill["px"], tx_cfill["px"]
+        # long(buy)は close-open、short(sell)は open-close で利益
         tx_pnl = (tx_c - tx_o) * size if tx_is_buy else (tx_o - tx_c) * size
-        pp_pnl = (pp_open_px - pp_close_px) * size if pp_is_buy else (pp_close_px - pp_open_px) * size
+        pp_pnl = (pp_close_px - pp_open_px) * size if pp_is_buy else (pp_open_px - pp_close_px) * size
         tx_fee = tx_fill.get("fee", 0) + tx_cfill.get("fee", 0)
         pp_fee = self.notional * ((self.fees["perpl_taker_bps"] if pp_taker else self.fees["perpl_maker_bps"])
                                   + self.fees["perpl_close_bps"]) / 1e4

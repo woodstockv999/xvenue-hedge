@@ -94,6 +94,15 @@ class XVenueHedge:
         self.pp_client = PerplClient(os.environ["PERPL_API_KEY"], os.environ["PERPL_API_KEY_SECRET"])
         self.pp_market = PerplMarketData("perpl:BTC", self.pp_client, PERPL_BTC_MCFG)
         self.pp_exec = PerplExecutor(self.pp_market, self.pp_client)
+        # A(2026-07-24): BBOを常駐板WS(公開market-data)から取り、REST get_context(CF 1015誘発)を減らす。
+        # 取れない/古いときは None→従来のREST短TTLキャッシュにフォールバック(WSは最適化・正ではない)。
+        self.pp_book = _pc.PerplBookFeed(self.pp_client.ws_url, PERPL_BTC_MCFG["market_id"],
+                                         PERPL_BTC_MCFG["price_decimals"])
+        self.pp_book.start()
+        # A2(2026-07-24): 建玉読みを常駐認証WS(PerplAccountFeed)から取り、CF 1015の主因である
+        # 「1操作1接続」の認証WSハンドシェイクを減らす。取れない/古いときは None→従来のREST/WS短命経路。
+        self.pp_account = _pc.PerplAccountFeed(self.pp_client)
+        self.pp_account.start()
 
         # --- 台帳(累積) ---
         self.cum_volume = 0.0
@@ -126,6 +135,16 @@ class XVenueHedge:
         bids, asks = b["levels"][0], b["levels"][1]
         return float(bids[0]["px"]), float(asks[0]["px"])
 
+    def _pp_szi(self) -> float:
+        """perpl BTC 符号付き建玉。常駐口座WS(handshake不要)を優先、取れなければ従来の
+        get_position_szi(1操作1接続)へフォールバック。両者とも失敗は0.0扱い(get_position_sziと同契約)。
+        ★fail-open(429で0.0)なので『建玉ゼロ確認してから発注』の判断には使わない(それは_fetch_position)。"""
+        p = self.pp_account.get_position(PERPL_BTC_MCFG["market_id"], PERPL_BTC_MCFG["price_decimals"],
+                                         PERPL_BTC_MCFG["size_decimals"])
+        if p is not None:
+            return p.get("szi", 0.0)
+        return self.pp_exec.get_position_szi()
+
     def _tx_marketable_px(self, is_buy: bool, bid: float, ask: float) -> float:
         """txflow taker IOC用の【確実約定価格】。touchちょうどだとBBO読取〜発注の間に板が
         動くとIOCが刺さらない(2026-07-23 hedge_fail実測の真因)。クロス方向にバッファを足す。
@@ -138,6 +157,11 @@ class XVenueHedge:
         """perpl BBO。get_best_bid_askはキャッシュ無しで毎回REST get_context(CF保護)を叩く=429主因。
         短TTLキャッシュで requote/open/close の連続読みを1回のRESTに畳む(BTC BBOは数秒で不変)。
         force_fresh=True で必ず取り直す(requoteのtouch移動判定など鮮度が要る所)。"""
+        # ① 常駐板WS(REST不要・CF 1015を誘発しない)。取れれば常にライブなのでキャッシュ不要。
+        bb = self.pp_book.get_best_bid_ask()
+        if bb is not None:
+            return bb
+        # ② フォールバック: REST get_context(短TTLキャッシュ)。WSが未起動/古い/切断中のとき。
         now = time.monotonic()
         if not force_fresh and self._pp_bbo_cache is not None:
             ts, val = self._pp_bbo_cache

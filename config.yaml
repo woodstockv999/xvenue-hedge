@@ -26,4 +26,4 @@ fees:
   perpl_close_bps: 0.0   # reduce≈無料
 
 # 実弾初回は1サイクルで停止(canary検証)。建玉フラット確認後にfalse。
-canary_once: true
+canary_once: false

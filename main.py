@@ -80,7 +80,8 @@ class XVenueHedge:
         self.dry_run = cfg.get("dry_run", True)
         self.notional = float(cfg["notional_usd"])
         self.fees = cfg["fees"]
-        self.coin = "1"  # BTC coin_index (txflow), perpl BTC=market1
+        self.symbol = cfg.get("symbol", "BTC")  # txflow place/cancel/l2book は symbol名("BTC")を取る(内部でcoin_index)
+        self.coin = "1"  # info l2Book 用の BTC coin_index。perpl BTC=market1
 
         # --- txflow(BTC価格・発注) ---
         load_dotenv(Path.home() / "apps" / "txflow-bot" / ".env")

@@ -101,6 +101,7 @@ class XVenueHedge:
         self.cum_fees = 0.0
         self.cycles = 0
         self.halted = False
+        self.dirty = False  # cycle例外後の未フラット疑い。両会場flat確認まで新規サイクルを止める
         self._load_ledger()
 
     def _load_ledger(self) -> None:
@@ -302,8 +303,7 @@ class XVenueHedge:
         try:
             pos = self.pp_exec._fetch_position()
             if pos is not None:
-                from perpl_exchange import scaled_to_size
-                sz = scaled_to_size(int(pos["s"]), self.pp_market.size_decimals)
+                sz = _pe.scaled_to_size(int(pos["s"]), self.pp_market.size_decimals)
                 if sz > 1e-8:
                     self._perpl_unwind(pos.get("sd") == 1, sz)  # sd==1(long)→sellで畳む
         except Exception as e:
@@ -324,6 +324,24 @@ class XVenueHedge:
                 log(f"startup_reconcile: txflow {abs(pos)} をフラット化")
         except Exception as e:
             log(f"⚠️ startup_reconcile txflow失敗={repr(e)[:50]}")
+
+    def _venues_flat(self) -> bool:
+        """両会場BTCがフラットか(fail-closed: 読めなければFalse=フラット未確認)。"""
+        try:
+            if self.pp_exec._fetch_position() is not None:
+                return False
+            if abs(self._tx_position()) > 1e-8:
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _reconcile_dirty(self) -> bool:
+        """cycle例外後の掃除。両会場をflatten(_startup_reconcileを再利用)し、
+        両会場flatを確認できたらTrue。perpl 429等で読めない/畳めない間はFalseを返し、
+        呼び側は新規サイクルを止めて次ループで再試行する(裸脚の上に建てない)。"""
+        self._startup_reconcile()  # reduce-only中心=idempotent。flatならno-op
+        return self._venues_flat()
 
     def _run_cycle_live(self, dir_buy: bool) -> dict:
         """改善①②③(2026-07-23): perpl maker を先行(patient+requote)、txflow を追従(maker→taker)。
@@ -463,6 +481,15 @@ class XVenueHedge:
                     log(f"⚠️ loss_budget${self.cfg['loss_budget_usd']}超過(net=${self.cum_net:.3f})=自己ハルト")
                 time.sleep(30)
                 continue
+            # cycle例外後は新規サイクルより先に両会場をフラット化(裸脚の上に建てない)
+            if self.dirty and not self.dry_run:
+                if self._reconcile_dirty():
+                    self.dirty = False
+                    log("error後reconcile: 両会場フラット確認。稼働再開")
+                else:
+                    log("⚠️ error後reconcile未完(両会場flat未確認)=次ループで再試行")
+                    time.sleep(self.cfg.get("cooldown_seconds", 10))
+                    continue
             try:
                 rec = self.run_cycle(dir_buy)
                 if rec.get("skip"):
@@ -475,7 +502,10 @@ class XVenueHedge:
                         log("canary_once: 1サイクル完了。停止(建玉フラット確認のこと)。")
                         return
             except Exception as e:
-                log(f"cycleエラー(継続): {repr(e)[:120]}")
+                # 例外はcycle途中(perpl脚約定後など)で起きうる=裸脚の疑い。
+                # dirtyを立て、次ループ先頭で両会場フラット化してから再開する。
+                self.dirty = True
+                log(f"cycleエラー(継続→次ループでflatten): {repr(e)[:120]}")
             time.sleep(self.cfg.get("cooldown_seconds", 10))
 
 

@@ -17,10 +17,15 @@
 import json
 from pathlib import Path
 
+import yaml
+
 HOME = Path.home()
 PAIR_HEDGE_CYCLES = HOME / "apps" / "hyperliquid-bot" / "shared" / "pair_hedge_cycles.jsonl"
 XVENUE_CYCLES = HOME / "apps" / "xvenue-hedge" / "data" / "cycles.jsonl"
+XVENUE_CONFIG = HOME / "apps" / "xvenue-hedge" / "config.yaml"
 TXFLOW_BOT_CYCLES = HOME / "apps" / "txflow-bot" / "data" / "cycles.jsonl"
+
+_FEES = (yaml.safe_load(XVENUE_CONFIG.read_text()) or {}).get("fees", {}) if XVENUE_CONFIG.exists() else {}
 
 
 def _read(path: Path, keep=lambda r: True) -> list[dict]:
@@ -46,17 +51,28 @@ def _acc(rows, vol_key="volume_usd", net_key="net_usd") -> dict:
 
 
 def _xvenue_by_venue(rows) -> dict:
-    """xvenueの各サイクルを会場別に按分。両脚同notionalなので vol=50/50, net=50/50。"""
+    """xvenueの各サイクルを会場別に【脚別実額】で分解(2026-07-24修正、旧50/50按分を廃止)。
+    - perpl脚net = perpl価格PnL - perpl脚fee(taker_hedgeなら6.9・通常maker0.9 + close無料)
+    - txflow脚net = txflow価格PnL - txflow脚fee(=記録fees_usd - perpl脚fee)
+    - 会場出来高 = 各脚 notional*2(open+close)
+    価格PnLは両脚でほぼ相殺するが、脚別feeが非対称(txflow taker中心 vs perpl maker中心)なので
+    50/50按分は実態とズレる。実測(2026-07-24)ではtxflow脚が損失の~71%を負担。"""
+    pm = _FEES.get("perpl_maker_bps", 0.9)
+    pt = _FEES.get("perpl_taker_bps", 6.9)
+    pc = _FEES.get("perpl_close_bps", 0.0)
     perpl = {"volume": 0.0, "net": 0.0, "n": 0}
     txflow = {"volume": 0.0, "net": 0.0, "n": 0}
     for r in rows:
-        vol = r.get("volume_usd", 0)
-        net = r.get("net_usd", 0)
-        # 会場出来高 = 各脚 notional*2(open+close)。両脚同額なので total/2 ずつ。
-        pv = tv = vol / 2.0
-        share = pv / vol if vol else 0.5
-        perpl["volume"] += pv; perpl["net"] += net * share; perpl["n"] += 1
-        txflow["volume"] += tv; txflow["net"] += net * (1 - share); txflow["n"] += 1
+        n = r.get("notional_usd", 0)
+        pp = r.get("perpl", {}) or {}
+        tx = r.get("txflow", {}) or {}
+        pp_open_bps = pt if pp.get("taker_hedge") else pm
+        pp_fee = n * (pp_open_bps + pc) / 1e4
+        tx_fee = max(0.0, r.get("fees_usd", 0) - pp_fee)  # 残りがtxflow脚fee
+        pp_net = pp.get("pnl", 0) - pp_fee
+        tx_net = tx.get("pnl", 0) - tx_fee
+        perpl["volume"] += n * 2; perpl["net"] += pp_net; perpl["n"] += 1
+        txflow["volume"] += n * 2; txflow["net"] += tx_net; txflow["n"] += 1
     return {"perpl": perpl, "txflow": txflow}
 
 
@@ -94,7 +110,7 @@ def build_report() -> str:
         "【戦略別】\n"
         + _eff_line("pair_hedge", "perpl SOL/ETH", ph) + "\n"
         + _eff_line("xvenue-hedge", "txflow×perpl BTC", xv) + "\n\n"
-        "【会場別】(xvenueは損益を出来高で按分)\n"
+        "【会場別】(xvenueは損益を脚別実額で分解=価格PnL+その脚のfee)\n"
         + _eff_line("perpl", "pair_hedge + xvenue perpl脚", perpl_venue) + "\n"
         + _eff_line("txflow", "xvenue txflow脚(txflow-bot退役)", txflow_venue)
     )

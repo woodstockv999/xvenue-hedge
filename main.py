@@ -379,37 +379,76 @@ class XVenueHedge:
         if not pp_filled:
             return {"skip": "perpl_lead_no_fill"}   # 建玉なし=安全に見送り
 
-        # perpl約定=裸perpl。txflow FOLLOWS(反対=dir_buy)で【即takerヘッジ】(2026-07-23方針)。
-        # 旧: post_only maker待ち→timeoutでtaker。makerは0.03bps極薄板で刺さりにくく、待つ間
-        # perpl脚が裸のまま(最大leg_timeout)=危険+完走率48%。txflow taker4.5bpsは安く1sで確実にヘッジ。
+        # perpl約定=裸perpl。txflow FOLLOWSでヘッジ。【hybrid: 短時間maker試行→taker】(2026-07-24)。
+        # perpl裸窓中にtxflow makerを最大 follow_maker_try_seconds 試す(刺されば1.5bps=taker4.5より3bps安)。
+        # 刺さらなければtakerで確実に裸窓を閉じる。裸窓は最大try秒(~3s)に延びる代償で手数料を削る。
         tx_is_buy = dir_buy
+        htry = float(self.cfg.get("follow_maker_try_seconds", 3.0))
+        frq = float(self.cfg.get("follow_maker_requote_seconds", 1.5))
         t_bid, t_ask = self._txflow_bbo()
-        tx_touch = t_ask if tx_is_buy else t_bid            # 約定はほぼtouch=台帳はこれで記録
-        tx_px = self._tx_marketable_px(tx_is_buy, t_bid, t_ask)  # 発注は板移動許容のバッファ付き
-        tx_taker = True
-        try:
-            self.tx.place_limit_order(self.symbol, tx_is_buy, tx_px, size,
-                                      reduce_only=False, tif=self.tx.TIF_IOC)
-        except Exception as e:
-            log(f"⚠️ txflow追従taker失敗({repr(e)[:50]})")
-        pos = 0.0
-        for _ in range(6):                          # 建玉反映のラグ吸収(clearinghouseは数秒遅れる=偽hedge_fail防止)
-            time.sleep(0.5)
+        tx_fill, tx_taker, mpx = None, False, (t_bid if tx_is_buy else t_ask)
+
+        # --- ① 短時間 maker試行(post_only + requote。建玉で裏取り) ---
+        ident, last_place, hdl = None, 0.0, time.time() + htry
+        while time.time() < hdl:
+            if ident is None:
+                t_bid, t_ask = self._txflow_bbo()
+                mpx = t_bid if tx_is_buy else t_ask     # maker join(buy@bid/sell@ask)
+                ident = self._tx_place_maker(tx_is_buy, mpx, size, reduce_only=False)
+                last_place = time.time()
+                if ident is None:                        # post_only拒否等→takerへ
+                    break
+            fl = self._tx_fill(ident, size)
+            if fl:
+                tx_fill = fl; break
             try:
-                pos = self._tx_position()
+                if abs(self._tx_position()) >= size * 0.5:  # fills遅延→建玉で裏取り
+                    tx_fill = {"px": mpx, "sz": size,
+                               "fee": self.notional * self.fees["txflow_maker_bps"] / 1e4}
+                    ident = None; break
             except Exception:
-                continue
-            if abs(pos) >= size * 0.5:
-                break
-        if abs(pos) < size * 0.5:                   # ヘッジ不成立→perpl脚unwind(裸回避)
-            log("⚠️ txflowヘッジ不成立→perpl脚をunwind(裸回避)")
-            self._perpl_unwind(perpl_is_buy, size)
-            # ★txflow takerが約定していて建玉読みがラグると txflow が裸残になりうる。
-            #   dirtyを立て次ループ先頭で両会場flatten確認(_reconcile_dirty)して塞ぐ。
-            self.dirty = True
-            return {"skip": "hedge_failed_unwound"}
-        tx_fill = {"px": tx_touch, "sz": abs(pos),
-                   "fee": self.notional * self.fees["txflow_taker_bps"] / 1e4}
+                pass
+            if time.time() - last_place >= frq:          # touch移動→置き直し
+                if isinstance(ident, int):
+                    try:
+                        self.tx.cancel_order(self.symbol, ident)
+                    except Exception:
+                        pass
+                ident = None
+            time.sleep(0.5)
+
+        # --- ② maker不成立 → taker で確実ヘッジ(裸窓を閉じる) ---
+        if not tx_fill:
+            if isinstance(ident, int):
+                try:
+                    self.tx.cancel_order(self.symbol, ident)
+                except Exception:
+                    pass
+            t_bid, t_ask = self._txflow_bbo()
+            tx_touch = t_ask if tx_is_buy else t_bid
+            tx_px = self._tx_marketable_px(tx_is_buy, t_bid, t_ask)  # 板移動許容バッファ付き
+            tx_taker = True
+            try:
+                self.tx.place_limit_order(self.symbol, tx_is_buy, tx_px, size,
+                                          reduce_only=False, tif=self.tx.TIF_IOC)
+            except Exception as e:
+                log(f"⚠️ txflow追従taker失敗({repr(e)[:50]})")
+            pos = 0.0
+            for _ in range(6):                          # 建玉反映ラグ吸収(偽hedge_fail防止)
+                time.sleep(0.5)
+                try:
+                    pos = self._tx_position()
+                except Exception:
+                    continue
+                if abs(pos) >= size * 0.5:
+                    break
+            if abs(pos) < size * 0.5:                   # ヘッジ不成立→perpl脚unwind(裸回避)
+                log("⚠️ txflowヘッジ不成立→perpl脚をunwind(裸回避)")
+                self._perpl_unwind(perpl_is_buy, size)
+                self.dirty = True                        # 裸残の疑い→次ループでflatten確認
+                return {"skip": "hedge_failed_unwound"}
+            tx_fill = {"px": tx_touch, "sz": abs(pos),
+                       "fee": self.notional * self.fees["txflow_taker_bps"] / 1e4}
 
         # === HOLD ===
         time.sleep(float(self.cfg["hold_seconds"]))

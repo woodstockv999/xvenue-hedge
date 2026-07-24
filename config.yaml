@@ -8,16 +8,16 @@ enabled: true
 
 symbol: "BTC"          # 対象資産(両会場共通)。perpl BTC=market1(tick$0.1)、txflow BTC=coin1
 notional_usd: 100      # perpl equity≈$173(free$65)/txflow$107。$100/3x=$33 free内。pair_hedge共有でバッファ薄=要監視
-hold_seconds: 45       # 建てて畳むまでの保有秒。120→45でスループット1.4倍(効率不変・露出短縮。funding無視可)
-cooldown_seconds: 15    # サイクル間クールダウン。429対策済みで30→15へ短縮(throughput↑)
+hold_seconds: 90       # 建てて畳むまでの保有秒。120→45でスループット1.4倍(効率不変・露出短縮。funding無視可)
+cooldown_seconds: 30    # サイクル間クールダウン。429対策済みで30→15へ短縮(throughput↑)
 
 # 改善①②(2026-07-23): perpl maker を先行(lead)させ patient に刺す + txflow を追従(follow)。
 #   旧構成(txflow先行→perpl追従)は perpl taker落ち76%だった。逆転で perpl maker率↑、
 #   追従が taker落ちしても安い txflow(4.5bps)<perpl(6.9bps)。
-perpl_lead_timeout_seconds: 30   # perpl maker先行の猶予。45→30で不成立を早く見切り次サイクルへ(no_fill空振り時間短縮=完走/時↑)
+perpl_lead_timeout_seconds: 45   # perpl maker先行の猶予。45→30で不成立を早く見切り次サイクルへ(no_fill空振り時間短縮=完走/時↑)
 requote_interval_seconds: 12      # perpl maker が touch から外れたら置き直す間隔(429回避で控えめ維持)
 close_requote_seconds: 3          # txflow closeのmaker置き直し間隔。5→3で追随を速くしclose taker落ち21%削減(txflowは429無縁で回数増OK)
-leg_timeout_seconds: 15          # closeのtxflow makerが刺さらなければtakerフォールバックの猶予
+leg_timeout_seconds: 40          # closeのtxflow maker猶予。15→40(案①2026-07-24)=close taker落ち削減で実損減。close中はperpl脚が開いたまま(perpl closeはtxflow close後)=待機延長もヘッジ維持で裸窓は増えない。代償はサイクル時間微増(maker不成立時のみ)
 # 追従(hedge)は即taker(2026-07-23)。IOCがtouchちょうどだと板移動で刺さらずhedge_fail→
 # クロス方向に8bpsバッファ。IOCは板最良値で約定=バッファは約定保証のみでコスト増にならない。
 taker_cross_bps: 8.0

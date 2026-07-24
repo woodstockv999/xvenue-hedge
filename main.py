@@ -67,7 +67,7 @@ PerplExecutor = _pe.PerplExecutor
 CYCLES_PATH = APP / "data" / "cycles.jsonl"
 STATUS_PATH = APP / "data" / "status.json"
 
-PERPL_MCFG = {"market_id": 40, "price_decimals": 4, "size_decimals": 2, "leverage": 3}  # HYPE(2026-07-24 案④)。BTC時代=id1/pd1/sd5
+PERPL_MCFG = {"market_id": 50, "price_decimals": 2, "size_decimals": 4, "leverage": 3}  # ZEC(2026-07-24 案④)。HYPE=id40/pd4/sd2(perpl spread広すぎでレース)→ZEC(perpl spr5.7bps)。BTC時代=id1/pd1/sd5
 
 
 def log(msg: str) -> None:
@@ -591,6 +591,16 @@ class XVenueHedge:
                 rec = self.run_cycle(dir_buy)
                 if rec.get("skip"):
                     log(f"cycle見送り: {rec['skip']}")
+                    # ★見送り時にperplへ想定外建玉(cancel-fillレースの残脚。2026-07-24 HYPEで多発)が
+                    #   あればガードがskipし続けて停止+脚放置になる。常駐AccountFeed(WS・429負荷ほぼ無)で
+                    #   検出したらdirtyを立て次ループで両会場flat化=停止と裸脚を自己修復する。
+                    if not self.dry_run:
+                        try:
+                            if abs(self._pp_szi()) > 1e-8:
+                                self.dirty = True
+                                log("⚠️ 見送り時にperpl残脚検出→次ループでflatten(自己修復)")
+                        except Exception:
+                            pass
                 else:
                     self._record(rec)
                     dir_buy = not dir_buy

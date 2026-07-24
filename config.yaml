@@ -8,7 +8,7 @@ enabled: true
 
 symbol: "BTC"          # 対象資産(両会場共通)。案④(薄銘柄でtxflow maker化)は確定ネガ2026-07-24=HYPE/ZECともperpl側ワイドspreadの価格損(-15bps)がtxflow maker節約(-3bps)に必ず負ける(会場間流動性の反転)→BTC復帰。BTCはperpl spread0.03bpsでレース無し・basis≈0で価格ヘッジほぼ完全。perpl BTC=market1、txflow BTC=coin1
 notional_usd: 150      # ①スケール2026-07-24: 100→150(perpl free$153実測・$150/3x=$50 free内)。xvenue perpl脚(効率9,636)の出来高を+50%=perpl会場ブレンドの9,636成分を成長。txflow$107/3x=$50内。★pair_hedgeと共有perpl口座=同時保有ピークを要監視
-hold_seconds: 60       # 8500狙い②(2026-07-24): 90→60でbasis露出1/3短縮=price drift(直近25で-$0.35/16%)を薄く削る。throughput↑でvolumeも増(farm順方向)・funding無視可。①txflow taker0%化(eff8272)+②で8500へ両輪
+hold_seconds: 90       # 8500狙い②(hold60)は棄却(2026-07-24): priceはbasisノイズで窓依存(-$0.35〜-$0.69)・制御不能→既知ベスト90へ復帰
 cooldown_seconds: 30    # サイクル間クールダウン。429対策済みで30→15へ短縮(throughput↑)
 
 # 改善①②(2026-07-23): perpl maker を先行(lead)させ patient に刺す + txflow を追従(follow)。
@@ -24,7 +24,7 @@ taker_cross_bps: 8.0
 # hybrid追従(2026-07-24): perpl裸窓中にtxflow makerを短時間試す→刺されば1.5bps(taker4.5より3bps安)。
 # 刺さらなければtakerで裸窓を閉じる。裸窓が最大try秒に延びる代償でfee削減。
 follow_maker_try_seconds: 6.0    # 案②2026-07-24: open maker試行窓。8sは実測で6sに劣後(taker_follow直近14=43%>直近25=32%・eff5738<6902、n=14ノイズ含むが押し上げ効果なし)→6sへ戻す。厚いtxflow BTC板の追従脚は価格が寄らねばmaker不成立=窓延長は裸窓を延ばすだけで最後taker
-follow_maker_requote_seconds: 1.0  # 8500狙い(2026-07-24): try窓内でtouchへの置き直しを1.5→1.0sに詰め、価格が寄る瞬間をmakerで拾う機会を+50%。taker落ち~37%→~15%が目標。fee寄与84%/price16%(直近25分解)=fee最適化の余地は正しく大きい
+follow_maker_requote_seconds: 1.5  # requote1.0(8500狙い)は棄却(2026-07-24): taker落ちは価格ドリブン(taker群price-$0.026 vs maker-$0.013=adverse-selection検出器・pair_hedge abortと同構造)でタイミングでは消せず、taker率32%→40-48%へ逆に上昇→既知ベスト1.5へ復帰
 # 改善③: perplは共有IPのCF 1015制限=pair_hedgeと帯域競合。poll間隔を空けて429緩和。
 poll_interval_seconds: 5          # fills RESTポーリング間隔。5s=45sリードで最大9回(旧3s=15回)
 

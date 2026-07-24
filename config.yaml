@@ -7,7 +7,7 @@ dry_run: false          # true=発注せず両会場の板から約定を模擬(
 enabled: true
 
 symbol: "BTC"          # 対象資産(両会場共通)。案④(薄銘柄でtxflow maker化)は確定ネガ2026-07-24=HYPE/ZECともperpl側ワイドspreadの価格損(-15bps)がtxflow maker節約(-3bps)に必ず負ける(会場間流動性の反転)→BTC復帰。BTCはperpl spread0.03bpsでレース無し・basis≈0で価格ヘッジほぼ完全。perpl BTC=market1、txflow BTC=coin1
-notional_usd: 100      # perpl equity≈$173(free$65)/txflow$107。$100/3x=$33 free内。pair_hedge共有でバッファ薄=要監視
+notional_usd: 150      # ①スケール2026-07-24: 100→150(perpl free$153実測・$150/3x=$50 free内)。xvenue perpl脚(効率9,636)の出来高を+50%=perpl会場ブレンドの9,636成分を成長。txflow$107/3x=$50内。★pair_hedgeと共有perpl口座=同時保有ピークを要監視
 hold_seconds: 90       # 建てて畳むまでの保有秒。120→45でスループット1.4倍(効率不変・露出短縮。funding無視可)
 cooldown_seconds: 30    # サイクル間クールダウン。429対策済みで30→15へ短縮(throughput↑)
 

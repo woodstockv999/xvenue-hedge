@@ -23,7 +23,7 @@ leg_timeout_seconds: 40          # closeのtxflow maker猶予。15→40(案①20
 taker_cross_bps: 8.0
 # hybrid追従(2026-07-24): perpl裸窓中にtxflow makerを短時間試す→刺されば1.5bps(taker4.5より3bps安)。
 # 刺さらなければtakerで裸窓を閉じる。裸窓が最大try秒に延びる代償でfee削減。
-follow_maker_try_seconds: 3.0
+follow_maker_try_seconds: 6.0    # 案②2026-07-24: open follow の maker試行窓を3→6s。openもmaker化狙い(刺されば-3bps)。BTCはbasis≈0で6s裸窓延長のドリフト小。openは3sで既に33%maker→延長で上乗せ。代償=perpl裸窓が最大6sに延びる(takerフォールバックで確実閉じは維持)
 follow_maker_requote_seconds: 1.5
 # 改善③: perplは共有IPのCF 1015制限=pair_hedgeと帯域競合。poll間隔を空けて429緩和。
 poll_interval_seconds: 5          # fills RESTポーリング間隔。5s=45sリードで最大9回(旧3s=15回)

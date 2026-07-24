@@ -16,8 +16,8 @@ txflowでBTCをmaker farm(将来pt)しつつ、perplで逆BTCをヘッジ=デル
 - loss_budget: 台帳の累積net損失が超えたら自己ハルト。
 - perplは共有IPのCF 1015レート制限あり=pair_hedgeと帯域競合。poll控えめ。
 
-## perpl:BTCは同一口座(2780、hlbotのperpl口座)だがhlbotの掃除対象外(perpl:BTCはself.symbols外
-   →sweep_orphan_stopsはskip、sweep_orphan_positionsは'ambiguous'=触らず通知のみ)。安全。
+## 本botのperpl脚は同一口座(2780、hlbotのperpl口座)だがhlbotの掃除対象外(取扱銘柄はself.symbols外
+   →sweep_orphan_stopsはskip、sweep_orphan_positionsは'ambiguous'=触らず通知のみ)。HYPEもpair_hedge(SOL/ETH)管理外で同様に安全。
 """
 import importlib.util
 import json
@@ -67,7 +67,7 @@ PerplExecutor = _pe.PerplExecutor
 CYCLES_PATH = APP / "data" / "cycles.jsonl"
 STATUS_PATH = APP / "data" / "status.json"
 
-PERPL_BTC_MCFG = {"market_id": 1, "price_decimals": 1, "size_decimals": 5, "leverage": 3}
+PERPL_MCFG = {"market_id": 40, "price_decimals": 4, "size_decimals": 2, "leverage": 3}  # HYPE(2026-07-24 案④)。BTC時代=id1/pd1/sd5
 
 
 def log(msg: str) -> None:
@@ -80,24 +80,27 @@ class XVenueHedge:
         self.dry_run = cfg.get("dry_run", True)
         self.notional = float(cfg["notional_usd"])
         self.fees = cfg["fees"]
-        self.symbol = cfg.get("symbol", "BTC")  # txflow place/cancel/l2book は symbol名("BTC")を取る(内部でcoin_index)
-        self.coin = "1"  # info l2Book 用の BTC coin_index。perpl BTC=market1
+        self.symbol = cfg.get("symbol", "HYPE")  # txflow place/cancel/l2book は symbol名を取る(内部でcoin_index)
 
         # --- txflow(BTC価格・発注) ---
         load_dotenv(Path.home() / "apps" / "txflow-bot" / ".env")
         tx_key = os.environ.get("TXFLOW_AGENT_PRIVATE_KEY") if not self.dry_run else None
         self.tx = TxflowClient(agent_private_key=tx_key,
                                main_address=os.environ.get("TXFLOW_MAIN_ADDRESS"))
+        self.coin = self.tx.coin_index(self.symbol)  # info l2Book 用の coin_index(HYPE=44)
+        _tx_sd = self.tx._symbol_meta[self.symbol.upper()]["size_decimals"]
+        # 両会場のsize_decimalsは異なる(HYPE: txflow=1/perpl=2)。粗い方に丸めれば両脚同量=裸デルタ回避。
+        self._size_round = min(_tx_sd, int(PERPL_MCFG["size_decimals"]))
 
         # --- perpl(BTC価格・ヘッジ発注) ---
         load_dotenv(Path.home() / "apps" / "hyperliquid-bot" / ".env")
         self.pp_client = PerplClient(os.environ["PERPL_API_KEY"], os.environ["PERPL_API_KEY_SECRET"])
-        self.pp_market = PerplMarketData("perpl:BTC", self.pp_client, PERPL_BTC_MCFG)
+        self.pp_market = PerplMarketData(f"perpl:{self.symbol}", self.pp_client, PERPL_MCFG)
         self.pp_exec = PerplExecutor(self.pp_market, self.pp_client)
         # A(2026-07-24): BBOを常駐板WS(公開market-data)から取り、REST get_context(CF 1015誘発)を減らす。
         # 取れない/古いときは None→従来のREST短TTLキャッシュにフォールバック(WSは最適化・正ではない)。
-        self.pp_book = _pc.PerplBookFeed(self.pp_client.ws_url, PERPL_BTC_MCFG["market_id"],
-                                         PERPL_BTC_MCFG["price_decimals"])
+        self.pp_book = _pc.PerplBookFeed(self.pp_client.ws_url, PERPL_MCFG["market_id"],
+                                         PERPL_MCFG["price_decimals"])
         self.pp_book.start()
         # A2(2026-07-24): 建玉読みを常駐認証WS(PerplAccountFeed)から取り、CF 1015の主因である
         # 「1操作1接続」の認証WSハンドシェイクを減らす。取れない/古いときは None→従来のREST/WS短命経路。
@@ -139,8 +142,8 @@ class XVenueHedge:
         """perpl BTC 符号付き建玉。常駐口座WS(handshake不要)を優先、取れなければ従来の
         get_position_szi(1操作1接続)へフォールバック。両者とも失敗は0.0扱い(get_position_sziと同契約)。
         ★fail-open(429で0.0)なので『建玉ゼロ確認してから発注』の判断には使わない(それは_fetch_position)。"""
-        p = self.pp_account.get_position(PERPL_BTC_MCFG["market_id"], PERPL_BTC_MCFG["price_decimals"],
-                                         PERPL_BTC_MCFG["size_decimals"])
+        p = self.pp_account.get_position(PERPL_MCFG["market_id"], PERPL_MCFG["price_decimals"],
+                                         PERPL_MCFG["size_decimals"])
         if p is not None:
             return p.get("szi", 0.0)
         return self.pp_exec.get_position_szi()
@@ -217,11 +220,13 @@ class XVenueHedge:
         return {"px": px, "sz": sz, "fee": fee}
 
     def _tx_position(self) -> float:
-        """txflow BTC 符号付き建玉(取引所の正)。失敗は例外(fail-closed用に呼び側で扱う)。"""
+        """txflow の対象銘柄の符号付き建玉(取引所の正)。失敗は例外(fail-closed用に呼び側で扱う)。
+        ★銘柄はself.symbol依存(2026-07-24: BTCハードコードがHYPE切替で常に0.0を返し裸txflowを量産した)。"""
         chs = self.tx.get_clearinghouse_state(self.tx.main_address)
+        sym = self.symbol.upper()
         for p in chs.get("assetPositions", []):
             pos = p["position"]
-            if str(pos["coin"]).split("-")[0].upper() == "BTC":
+            if str(pos["coin"]).split("-")[0].upper() == sym:
                 return float(pos.get("szi", 0))
         return 0.0
 
@@ -308,7 +313,7 @@ class XVenueHedge:
             if self.pp_exec.poll_maker_fill(oid, since_ms):
                 return True, px
             if time.time() - last_place >= rq:       # requote: touchが動いてたら置き直す
-                if abs(self.pp_exec.get_position_szi()) >= size * 0.999:  # requote前に建玉=正で確認
+                if abs(self._pp_szi()) >= size * 0.999:  # requote前に建玉=正で確認
                     return True, px
                 p_bid, p_ask = self._perpl_bbo()
                 new_px = p_bid if is_buy else p_ask
@@ -325,7 +330,7 @@ class XVenueHedge:
             except Exception:
                 pass
         time.sleep(1)
-        if abs(self.pp_exec.get_position_szi()) >= size * 0.5:
+        if abs(self._pp_szi()) >= size * 0.5:
             return True, px                          # 建玉あり=約定してた(poll false-negative)
         return False, None
 
@@ -341,7 +346,7 @@ class XVenueHedge:
             log(f"⚠️ perpl unwind失敗={repr(e)[:50]} 手動フラット化要")
 
     def _startup_reconcile(self) -> None:
-        """起動時に両会場のBTCをフラット化(mid-cycle再起動での建玉残存/2倍化を防ぐ)。dry_runは無処理。"""
+        """起動時に両会場の対象銘柄をフラット化(mid-cycle再起動での建玉残存/2倍化を防ぐ)。dry_runは無処理。"""
         if self.dry_run:
             return
         # perpl BTC: 生の建玉(fail-openしない)を読んで方向付きで畳む
@@ -371,7 +376,7 @@ class XVenueHedge:
             log(f"⚠️ startup_reconcile txflow失敗={repr(e)[:50]}")
 
     def _venues_flat(self) -> bool:
-        """両会場BTCがフラットか(fail-closed: 読めなければFalse=フラット未確認)。"""
+        """両会場の対象銘柄がフラットか(fail-closed: 読めなければFalse=フラット未確認)。"""
         try:
             if self.pp_exec._fetch_position() is not None:
                 return False
@@ -395,7 +400,7 @@ class XVenueHedge:
         lt = float(self.cfg["leg_timeout_seconds"])
         poll = float(self.cfg["poll_interval_seconds"])
         t_bid, t_ask = self._txflow_bbo()
-        size = round(self.notional / ((t_bid + t_ask) / 2), 5)  # BTC size_decimals=5
+        size = round(self.notional / ((t_bid + t_ask) / 2), self._size_round)  # 両会場の粗い方(HYPE=txflow sd1)に丸め裸デルタ回避
 
         # === OPEN: perpl maker LEAD(patient+requote) ===
         perpl_is_buy = not dir_buy
@@ -518,7 +523,7 @@ class XVenueHedge:
             else:
                 tx_cfill = {"px": tx_cpx, "sz": size, "fee": 0.0}
         # perpl reduce-only close(reduce≈無料・確実)
-        pp_szi = self.pp_exec.get_position_szi()
+        pp_szi = self._pp_szi()
         p_bid, p_ask = self._perpl_bbo()
         pp_close_px = (p_bid + p_ask) / 2
         if abs(pp_szi) > 1e-8:

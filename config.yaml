@@ -6,7 +6,7 @@
 dry_run: false          # true=発注せず両会場の板から約定を模擬(構造+台帳の検証)
 enabled: true
 
-symbol: "BTC"          # 対象資産(両会場共通)。perpl BTC=market1(tick$0.1)、txflow BTC=coin1
+symbol: "HYPE"         # 対象資産(両会場共通)。案④2026-07-24: BTC(板深すぎ=txflow taker強制)→HYPE(txflow板最薄$2.5k=maker約定狙い)。perpl HYPE=market40(pd4/sd2)、txflow HYPE=coin44(sd1)。代償=perpl HYPEはspread16bpsと広くリード約定率↓の可能性
 notional_usd: 100      # perpl equity≈$173(free$65)/txflow$107。$100/3x=$33 free内。pair_hedge共有でバッファ薄=要監視
 hold_seconds: 90       # 建てて畳むまでの保有秒。120→45でスループット1.4倍(効率不変・露出短縮。funding無視可)
 cooldown_seconds: 30    # サイクル間クールダウン。429対策済みで30→15へ短縮(throughput↑)

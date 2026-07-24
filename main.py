@@ -67,7 +67,7 @@ PerplExecutor = _pe.PerplExecutor
 CYCLES_PATH = APP / "data" / "cycles.jsonl"
 STATUS_PATH = APP / "data" / "status.json"
 
-PERPL_MCFG = {"market_id": 50, "price_decimals": 2, "size_decimals": 4, "leverage": 3}  # ZEC(2026-07-24 案④)。HYPE=id40/pd4/sd2(perpl spread広すぎでレース)→ZEC(perpl spr5.7bps)。BTC時代=id1/pd1/sd5
+PERPL_MCFG = {"market_id": 1, "price_decimals": 1, "size_decimals": 5, "leverage": 3}  # BTC(2026-07-24 案④確定ネガ=HYPE/ZECはperplワイドspreadの価格損がtxflow maker節約に必ず負ける→BTC復帰)。HYPE=id40/pd4/sd2・ZEC=id50/pd2/sd4
 
 
 def log(msg: str) -> None:

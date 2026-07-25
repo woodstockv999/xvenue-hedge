@@ -581,6 +581,10 @@ class XVenueHedge:
         t_bid2, t_ask2 = self._txflow_bbo()
         tx_cpx = t_bid2 if tx_close_buy else t_ask2
         tx_cfill, cid, last_place, dl = None, None, 0.0, time.time() + lt
+        # ★このサイクルでcloseに使った全ident(requoteで捨てた分も含む)。取消×約定レースで
+        #   「取消したつもりの指値が約定していた」場合に実約定を回収するために必要
+        #   (2026-07-25: 保持していなかったため19%のサイクルでclose価格を捏造していた)。
+        close_idents = []
         while time.time() < dl:                        # closeもrequote(touch追随)でmaker取りこぼし改善
             if cid is None:
                 t_bid2, t_ask2 = self._txflow_bbo()
@@ -589,6 +593,7 @@ class XVenueHedge:
                 last_place = time.time()
                 if cid is None:                        # reduce_only拒否(既flat等)→taker/確認へ
                     break
+                close_idents.append(cid)
             tx_cfill = self._tx_fill(cid, size)
             if tx_cfill:
                 break
@@ -614,7 +619,22 @@ class XVenueHedge:
                                           reduce_only=True, tif=self.tx.TIF_IOC)
                 tx_cfill = {"px": touch, "sz": abs(pos), "fee": self.notional * self.fees["txflow_taker_bps"] / 1e4}
             else:
-                tx_cfill = {"px": tx_cpx, "sz": size, "fee": 0.0}
+                # 既にフラット = 置いた reduce-only maker のどれかが約定していた(取消×約定レース。
+                # 「reduce_only拒否」ログの正体はこれ)。**実約定をfillsから回収する** — 以前は
+                # px=現在touch / fee=0 を捏造しており、close価格の誤りとmaker手数料1.5bpsの
+                # 計上漏れで net が甘く出ていた(実測: 全219サイクルの19%=42本が該当)。
+                for ident in reversed(close_idents):
+                    fl = self._tx_fill(ident, size)
+                    if fl:
+                        tx_cfill = fl
+                        break
+                if not tx_cfill:
+                    # fills が追いつかない/identが取れなかった。**捏造せず maker 手数料を計上**し、
+                    # 価格は最後のtouch近似のまま「回収失敗」を記録に残す(黙って甘い数字にしない)。
+                    log("⚠️ txflow close: 既flatだが実約定を回収できず(px=touch近似・maker手数料で計上)")
+                    tx_cfill = {"px": tx_cpx, "sz": size,
+                                "fee": self.notional * self.fees["txflow_maker_bps"] / 1e4,
+                                "recovered": False}
         # perpl reduce-only close(reduce≈無料・確実)
         pp_szi = self._pp_szi()
         p_bid, p_ask = self._perpl_bbo()
@@ -726,9 +746,11 @@ class XVenueHedge:
                     log("⚠️ error後reconcile未完(両会場flat未確認)=次ループで再試行")
                     time.sleep(self.cfg.get("cooldown_seconds", 10))
                     continue
+            skipped = False
             try:
                 rec = self.run_cycle(dir_buy)
                 if rec.get("skip"):
+                    skipped = True
                     log(f"cycle見送り: {rec['skip']}")
                     # ★見送り時にperplへ想定外建玉(cancel-fillレースの残脚。2026-07-24 HYPEで多発)が
                     #   あればガードがskipし続けて停止+脚放置になる。常駐AccountFeed(WS・429負荷ほぼ無)で
@@ -774,7 +796,12 @@ class XVenueHedge:
                 # dirtyを立て、次ループ先頭で両会場フラット化してから再開する。
                 self.dirty = True
                 log(f"cycleエラー(継続→次ループでflatten): {repr(e)[:120]}")
-            time.sleep(self.cfg.get("cooldown_seconds", 10))
+            # 見送り(=建玉を1枚も取っていない)にフルcooldownを課す理由が無い。実測(07-25 12時以降)
+            # では見送り1回=中位81s のうち30sがこのcooldownで、lead不成立率36.7%なので
+            # 完走あたり ~17s の純粋な待ち。連続見送りの429自己増幅は上の skip_streak_backoff が
+            # 別に受け持つので、単発の見送りは短く回して次の試行に移る。
+            time.sleep(float(self.cfg.get("skip_cooldown_seconds", 5)) if skipped
+                       else float(self.cfg.get("cooldown_seconds", 10)))
 
 
 def main() -> None:

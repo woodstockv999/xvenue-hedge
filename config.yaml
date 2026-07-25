@@ -10,6 +10,14 @@ symbol: "BTC"          # 対象資産(両会場共通)。案④(薄銘柄でtxfl
 notional_usd: 150      # ①スケール2026-07-24: 100→150(perpl free$153実測・$150/3x=$50 free内)。xvenue perpl脚(効率9,636)の出来高を+50%=perpl会場ブレンドの9,636成分を成長。txflow$107/3x=$50内。★pair_hedgeと共有perpl口座=同時保有ピークを要監視
 hold_seconds: 90       # 8500狙い②(hold60)は棄却(2026-07-24): priceはbasisノイズで窓依存(-$0.35〜-$0.69)・制御不能→既知ベスト90へ復帰
 cooldown_seconds: 30    # サイクル間クールダウン。429対策済みで30→15へ短縮(throughput↑)
+skip_cooldown_seconds: 5   # 2026-07-25追加: **見送り時**のクールダウン(建玉を取っていないので
+                           # 冷やす対象が無い)。実測(07-25 12時以降): lead不成立率36.7%・見送り1回
+                           # 中位81s のうち30sがcooldown → 完走あたり~17sの純待ち。5sにして throughput
+                           # +約7%(16.1→17.3 cycles/h 試算)。連続見送りの429自己増幅は
+                           # skip_streak_backoff_after(5連続)が別に受け持つので単発は短くて安全。
+                           # ★perpl_lead_timeout_seconds の延長(45→90)は**採らなかった**: 見送りは
+                           #   減るが requote_interval 12s のため1試行あたりのAPI操作が倍増し、
+                           #   完走あたりの操作数は 6.3→9.2 と悪化=429を増やす方向。
 
 # 改善①②(2026-07-23): perpl maker を先行(lead)させ patient に刺す + txflow を追従(follow)。
 #   旧構成(txflow先行→perpl追従)は perpl taker落ち76%だった。逆転で perpl maker率↑、

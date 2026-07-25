@@ -117,6 +117,7 @@ class XVenueHedge:
         self._pp_bbo_cache = None                       # (monotonic時刻, (bid,ask)) 429緩和のBBO短TTL
         self._pp_bbo_ttl = float(cfg.get("perpl_bbo_ttl_seconds", 2.0))
         self._rl_backoff = 0.0                          # perpl 429時のエスカレート待機(clean cycleで0へ)
+        self._skip_streak = 0                           # 連続見送り数。詰まったまま叩き続ける自己増幅429を止める
         self._load_ledger()
 
     def _load_ledger(self) -> None:
@@ -291,6 +292,42 @@ class XVenueHedge:
         }
 
     # ================= 実弾サイクル =================
+    def _pp_cancel_verified(self, oid: int, tries: int = 3) -> bool:
+        """perpl の resting 取消を『板から消えた』まで確認する。消えたらTrue。
+
+        PerplExecutor.cancel_order は失敗しても例外を投げない(内部でログして戻る)ため、
+        投げっぱなしだと取消できなかった resting が板に残る。孤児 resting が1本でも残ると
+        place_maker_resting のガード(_entry_preconditions_ok)が以降**全サイクル**で発注を
+        拒否し、xvenue-hedge には掃除役がいない(hlbot の sweep_orphan_stops は
+        `coin not in self.symbols` で perpl:BTC を skip する)ため永久に復帰しない。
+        2026-07-25 に 6.5時間サイクルゼロで停止した実害の対策。"""
+        for _ in range(tries):
+            try:
+                self.pp_exec.cancel_order(oid)
+            except Exception:
+                pass
+            try:
+                live = self.pp_exec.list_open_maker_orders()
+            except Exception:
+                live = None
+            if live is not None and all(int(o) != int(oid) for _, o in live):
+                return True
+            time.sleep(2)
+        log(f"⚠️ perpl resting oid={oid} を取消せない(板に残存)=次サイクルはガードでskipされる")
+        return False
+
+    def _pp_partial_abort(self, oid, is_buy: bool, filled_sz: float) -> None:
+        """perpl lead の**部分約定は『未約定』として扱う**(残 resting を取消し約定ぶんを畳む)。
+
+        PerplExecutor.place_order と同じ契約: 部分約定を『約定』として返すと、呼び側は全量
+        (size)でヘッジ・損益計上するのに取引所には端数しか無い状態になる。実際 2026-07-25 の
+        cycle#125 は 0.00027/0.0023(11.7%)しか約定していないのに全量約定として扱われ、
+        ヘッジの88%が裸・台帳も過大計上・残 resting が孤児化して bot が停止した。"""
+        self._pp_cancel_verified(oid)
+        if filled_sz > 1e-8:
+            self._perpl_unwind(is_buy, filled_sz)
+        self.dirty = True  # 畳めたか確認できていない→次ループ先頭で両会場flatを確認する
+
     def _perpl_maker_lead(self, is_buy: bool, size: float):
         """改善①②: perpl maker を先行させ requote しながら perpl_lead_timeout まで刺しにいく。
         戻り(filled, fill_px)。未約定は(False,None)。建玉=正でfill確認(false-negative対策)。
@@ -310,28 +347,39 @@ class XVenueHedge:
                 if oid is None:
                     time.sleep(poll)
                     continue
-            if self.pp_exec.poll_maker_fill(oid, since_ms):
-                return True, px
-            if time.time() - last_place >= rq:       # requote: touchが動いてたら置き直す
-                if abs(self._pp_szi()) >= size * 0.999:  # requote前に建玉=正で確認
+            f = self.pp_exec.poll_maker_fill(oid, since_ms)
+            if f:
+                fsz = float(f.get("sz") or 0.0)
+                if fsz >= size * 0.999:
                     return True, px
+                log(f"perpl lead 部分約定 {fsz}/{size} → 残restingを取消し畳んで見送り")
+                self._pp_partial_abort(oid, is_buy, fsz)
+                return False, None
+            if time.time() - last_place >= rq:       # requote: touchが動いてたら置き直す
+                szi = abs(self._pp_szi())
+                if szi >= size * 0.999:              # requote前に建玉=正で確認
+                    return True, px
+                if szi > 1e-8:                       # 部分約定。置き直さず畳む(残りは孤児化する)
+                    log(f"perpl lead 部分建玉 {szi}/{size} → 残restingを取消し畳んで見送り")
+                    self._pp_partial_abort(oid, is_buy, szi)
+                    return False, None
                 p_bid, p_ask = self._perpl_bbo()
                 new_px = p_bid if is_buy else p_ask
                 if new_px != px:
-                    try:
-                        self.pp_exec.cancel_order(oid)
-                    except Exception:
-                        pass
+                    if not self._pp_cancel_verified(oid):
+                        return False, None           # 取消未確認で置き直すと建玉が2倍になる
                     oid = None
             time.sleep(poll)
         if oid:
-            try:
-                self.pp_exec.cancel_order(oid)
-            except Exception:
-                pass
+            self._pp_cancel_verified(oid)
         time.sleep(1)
-        if abs(self._pp_szi()) >= size * 0.5:
+        szi = abs(self._pp_szi())
+        if szi >= size * 0.999:
             return True, px                          # 建玉あり=約定してた(poll false-negative)
+        if szi > 1e-8:                               # timeout時の部分約定=ヘッジ相手のいない裸脚
+            log(f"perpl lead timeout時に部分建玉 {szi}/{size} → 畳んで見送り")
+            self._perpl_unwind(is_buy, szi)
+            self.dirty = True
         return False, None
 
     def _perpl_unwind(self, was_buy: bool, size: float) -> None:
@@ -601,14 +649,26 @@ class XVenueHedge:
                                 log("⚠️ 見送り時にperpl残脚検出→次ループでflatten(自己修復)")
                         except Exception:
                             pass
+                    # 見送りが続く=perplを叩いても成立しない状態。cooldownのまま回すと
+                    # WS再接続を1.3秒ごとに投げ続けてCF 1015を自分で焚きつける(2026-07-25の
+                    # 6.5時間停止では309連続見送りの間ずっと429を煽っていた)。例外が飛ばない
+                    # 経路(ガードのfail-closedはskipを返すだけ)なので連続数で待機を伸ばす。
+                    self._skip_streak += 1
+                    if self._skip_streak >= int(self.cfg.get("skip_streak_backoff_after", 5)):
+                        base = float(self.cfg.get("rl_backoff_base_seconds", 30))
+                        cap = float(self.cfg.get("rl_backoff_cap_seconds", 240))
+                        self._rl_backoff = min(cap, base if self._rl_backoff <= 0 else self._rl_backoff * 2)
+                        log(f"見送り{self._skip_streak}連続={self._rl_backoff:.0f}s バックオフ(叩くのを止める)")
+                        time.sleep(self._rl_backoff)
                 else:
                     self._record(rec)
                     dir_buy = not dir_buy
+                    self._skip_streak = 0
+                    self._rl_backoff = 0.0               # 完走した=詰まっていない。バックオフ解除
                     # 初回実弾は1サイクルで停止(canary検証用。確認後にfalseへ)
                     if not self.dry_run and self.cfg.get("canary_once", False):
                         log("canary_once: 1サイクル完了。停止(建玉フラット確認のこと)。")
                         return
-                self._rl_backoff = 0.0                   # clean cycle=429バックオフ解除
             except _pc.PerplRateLimitError as e:
                 # CF 1015はIPレート制限=即再突入するとバンを延ばす。エスカレート待機で叩くのを止める。
                 self.dirty = True                        # 途中でperpl脚が建った疑い→次ループでflatten

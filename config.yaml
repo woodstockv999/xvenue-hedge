@@ -36,7 +36,18 @@ skip_streak_backoff_after: 5   # 見送りが何連続したらバックオフ�
 rl_backoff_base_seconds: 30
 rl_backoff_cap_seconds: 240
 
-loss_budget_usd: 20     # 台帳の累積net損失がこれを超えたら自己ハルト(発注停止)
+# 撤退基準(2026-07-25 改定): 出来高ファーミングが目的なので生$の損失は撤退基準にしない。
+#   旧 loss_budget_usd: 20 は 07-25 15:57 に net-$20.029 で発火し、**効率6,248(構造天井~6,700の93%・
+#   pt換算では黒字: $125k×10pt/$100k×$2.04 = 収入$25.5 vs 損失$20.0)なのに優等生の方を止めた**。
+#   pair_hedge が 07-20 に通った同じ道(config.yaml efficiency_floor のコメント参照)を踏む。
+#   判定は「効率(出来高$÷損失$)」。loss_budget はバグ暴走時の外側安全弁としてのみ残す。
+efficiency_floor: 4900   # 分岐点=10pt/$100k×$2.04/pt → 効率4,902。これを割ったら出来高を積む意味が
+                         # 無くなるので停止。実測レンジは6,100-6,250(天井~6,700)なので十分下。
+                         # ★pt単価が動いたら見直す。$2.04→$5なら分岐点は2,000まで下がる。
+efficiency_min_volume_usd: 1000   # この出来高に達するまでは効率ハルトを評価しない(初動は1サイクルの
+                                  # 誤差で効率が乱高下し誤ハルトする)。pair_hedge と同値。
+loss_budget_usd: 200    # 2026-07-25 20→200: 撤退基準の主役を efficiency_floor に移したので、
+                        # ここはバグ由来の暴走(想定外サイズ・脚放置の連鎖)にだけ効く外側の弁。
 
 # 実測接地の手数料(bps)。txflow=cycles.jsonl逆算、perpl=exchange docstring。
 fees:

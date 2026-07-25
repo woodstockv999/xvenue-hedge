@@ -22,6 +22,7 @@ txflowでBTCをmaker farm(将来pt)しつつ、perplで逆BTCをヘッジ=デル
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import time
 import types
@@ -114,6 +115,7 @@ class XVenueHedge:
         self.cum_fees = 0.0
         self.cycles = 0
         self.halted = False
+        self.halted_reason = ""
         self.dirty = False  # cycle例外後の未フラット疑い。両会場flat確認まで新規サイクルを止める
         self._pp_bbo_cache = None                       # (monotonic時刻, (bid,ask)) 429緩和のBBO短TTL
         self._pp_bbo_ttl = float(cfg.get("perpl_bbo_ttl_seconds", 2.0))
@@ -642,6 +644,52 @@ class XVenueHedge:
             "fees_usd": round(fees, 6), "volume_usd": round(self.notional * 4, 4), "net_usd": round(net, 6),
         }
 
+    def _write_status(self) -> Optional[float]:
+        """status.json を書き、効率(net<0のときのみ)を返す。
+
+        ★_record からだけでなく**ハルト時にも呼ぶ** — 2026-07-25、_record 経由でしか書いていな
+        かったため loss_budget ハルト後も `halted: false` のまま status が固まり、45分の停止を
+        外から検知できずユーザーの目視で見つかった(cycleが止まる=statusも止まる、が盲点)。"""
+        eff = (self.cum_volume / abs(self.cum_net)) if self.cum_net < 0 else None
+        STATUS_PATH.write_text(json.dumps({
+            "updated_ts": int(time.time()), "dry_run": self.dry_run, "halted": self.halted,
+            "halted_reason": self.halted_reason,
+            "cycles": self.cycles, "cum_volume_usd": round(self.cum_volume, 2),
+            "cum_fees_usd": round(self.cum_fees, 4), "cum_net_usd": round(self.cum_net, 4),
+            "efficiency": round(eff, 1) if eff else None,
+        }, indent=2))
+        return eff
+
+    def _notify_halt(self, reason: str) -> None:
+        """自己ハルトを Discord へ1回だけ通知(状態遷移時のみ)。fail-open — 通知の失敗で
+        botを落とさない。共通CLI経由(curl直叩き禁止。~/CLAUDE.md)。"""
+        body = (f"{reason}\n"
+                f"cycles={self.cycles} 出来高=${self.cum_volume:,.0f} net=${self.cum_net:+.3f}\n"
+                f"発注は停止した(両会場は最終サイクルでフラット)。config見直しまで再開しない。")
+        try:
+            subprocess.run(["discord-notify", "-t", "xvenue-hedge 自己ハルト", "-c", "red", body],
+                           timeout=15, check=False)
+        except Exception:
+            pass
+
+    def _halt_reason(self) -> Optional[str]:
+        """撤退基準。主役は**効率(出来高$÷損失$)**で、loss_budget はバグ暴走用の外側の弁
+        (2026-07-25 改定。config.yaml の efficiency_floor コメント参照)。"""
+        if self.cum_net <= -float(self.cfg["loss_budget_usd"]):
+            return (f"loss_budget${self.cfg['loss_budget_usd']}超過"
+                    f"(net=${self.cum_net:.3f})")
+        floor = float(self.cfg.get("efficiency_floor", 0) or 0)
+        if floor <= 0 or self.cum_net >= 0:
+            return None
+        # 初動は1サイクルの誤差で効率が乱高下するので、一定の出来高が乗るまで評価しない。
+        if self.cum_volume < float(self.cfg.get("efficiency_min_volume_usd", 1000)):
+            return None
+        eff = self.cum_volume / abs(self.cum_net)
+        if eff < floor:
+            return (f"効率{eff:.0f}(出来高${self.cum_volume:.0f}/損失${-self.cum_net:.3f})が"
+                    f"floor{floor:.0f}割れ")
+        return None
+
     def _record(self, rec: dict) -> None:
         with CYCLES_PATH.open("a") as f:
             f.write(json.dumps(rec, separators=(",", ":")) + "\n")
@@ -649,16 +697,9 @@ class XVenueHedge:
         self.cum_net += rec["net_usd"]
         self.cum_fees += rec["fees_usd"]
         self.cycles += 1
-        eff = (self.cum_volume / abs(self.cum_net)) if self.cum_net < 0 else None
-        status = {
-            "updated_ts": int(time.time()), "dry_run": self.dry_run, "halted": self.halted,
-            "cycles": self.cycles, "cum_volume_usd": round(self.cum_volume, 2),
-            "cum_fees_usd": round(self.cum_fees, 4), "cum_net_usd": round(self.cum_net, 4),
-            "efficiency": round(eff, 1) if eff else None,
-        }
-        STATUS_PATH.write_text(json.dumps(status, indent=2))
+        eff = self._write_status()
         log(f"cycle#{self.cycles} vol=${rec['volume_usd']:.0f} net=${rec['net_usd']:+.4f} "
-            f"cum_net=${self.cum_net:+.3f} eff={status['efficiency']}")
+            f"cum_net=${self.cum_net:+.3f} eff={round(eff, 1) if eff else None}")
 
     def loop(self) -> None:
         log(f"xvenue-hedge 起動: dry_run={self.dry_run} notional=${self.notional} "
@@ -666,10 +707,14 @@ class XVenueHedge:
         self._startup_reconcile()  # 起動時に両会場BTCフラット(再起動での建玉残存防止)
         dir_buy = True
         while self.cfg.get("enabled", True):
-            if self.cum_net <= -float(self.cfg["loss_budget_usd"]):
+            reason = self._halt_reason()
+            if reason:
                 if not self.halted:
                     self.halted = True
-                    log(f"⚠️ loss_budget${self.cfg['loss_budget_usd']}超過(net=${self.cum_net:.3f})=自己ハルト")
+                    self.halted_reason = reason
+                    log(f"⚠️ 自己ハルト: {reason}")
+                    self._write_status()   # ハルトを status.json に残す(外から検知できるように)
+                    self._notify_halt(reason)
                 time.sleep(30)
                 continue
             # cycle例外後は新規サイクルより先に両会場をフラット化(裸脚の上に建てない)

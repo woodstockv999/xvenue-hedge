@@ -284,7 +284,7 @@ class XVenueHedge:
         volume = self.notional * 2 * 2  # 両会場 × open+close
         net = tx_pnl + pp_pnl - fees
         return {
-            "ts": round(time.time(), 3), "dir_buy": dir_buy, "dry_run": True,
+            "ts": round(time.time(), 3), "symbol": self.symbol, "dir_buy": dir_buy, "dry_run": True,
             "size": size, "notional_usd": self.notional,
             "txflow": {"open": tx_open, "close": tx_close, "pnl": round(tx_pnl, 5)},
             "perpl": {"open": pp_open, "close": pp_close, "pnl": round(pp_pnl, 5)},
@@ -588,11 +588,14 @@ class XVenueHedge:
         fees = tx_fee + pp_fee
         net = tx_pnl + pp_pnl - fees
         return {
-            "ts": round(time.time(), 3), "dir_buy": dir_buy, "dry_run": False,
+            "ts": round(time.time(), 3), "symbol": self.symbol, "dir_buy": dir_buy, "dry_run": False,
             "size": size, "notional_usd": self.notional,
             "txflow": {"open": tx_o, "close": tx_c, "pnl": round(tx_pnl, 5), "taker_follow": tx_taker},
+            # size/notional は脚別の実額。銘柄別・会場別の集計が全量約定を前提にしないためのもの
+            # (2026-07-25: 部分約定を全量計上して台帳が汚れた実害の再発防止)。
             "perpl": {"open": round(pp_open_px, 1), "close": round(pp_close_px, 1),
-                      "pnl": round(pp_pnl, 5), "taker_hedge": False},
+                      "pnl": round(pp_pnl, 5), "taker_hedge": False,
+                      "size": size, "notional": round(pp_open_px * size, 4)},
             "fees_usd": round(fees, 6), "volume_usd": round(self.notional * 4, 4), "net_usd": round(net, 6),
         }
 

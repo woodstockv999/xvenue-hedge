@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""効率値(出来高÷損失)を「戦略別」と「会場別」で出す。cron+discord-notifyで定期通知にも使う。
+"""効率値(出来高÷損失)を「戦略別」「会場別」「銘柄別」で出す。cron+discord-notifyで定期通知にも使う。
 
 ## 戦略別
 - pair_hedge (perpl SOL/ETH farm): cyclesを現行銘柄(seq_lead=perpl:SOL)で絞る
@@ -11,6 +11,14 @@
 - txflow = txflow-bot(ARB/HBAR等の自前ペア) + xvenue txflow脚
 - ★xvenueはクロス会場なので、1サイクルのnetを各会場の出来高比で按分する(両脚同notional=50/50)。
   価格PnLは両脚で相殺するため脚別PnLでなく「出来高按分」で会場コストを均す(ユーザー方針2026-07-23)。
+
+## 銘柄別(どの銘柄が効率を沈めているか)
+- xvenue = 1サイクル1銘柄なので `symbol` でそのまま分ける(2026-07-25から記録。旧行はBTC後付け)。
+- pair_hedge = 1サイクルにSOL脚とETH脚が同居する。**脚別の価格PnLは分離できない**(ヘッジで相殺
+  するのが前提の戦略)ので、会場別と同じ「出来高按分」でnetを脚に配る(ユーザー方針2026-07-23)。
+  脚の出来高は `fills[symbol]` の px×size×2(open+close)。片脚abortはその脚だけに出来高が立つので
+  abortコストは刺さった脚に寄る=「どちらの脚が損を出しているか」を読む指標になる。
+- txflow-bot(ARB/HBAR)は2026-07-23退役のため前向き指標から外す(会場別と同じ扱い)。
 
 効率= 出来高 ÷ |net| (net<0のとき)。net≥0(黒字)は損失ゼロ=効率無限大として出来高/手数料を参考表示。
 """
@@ -66,14 +74,50 @@ def _xvenue_by_venue(rows) -> dict:
         n = r.get("notional_usd", 0)
         pp = r.get("perpl", {}) or {}
         tx = r.get("txflow", {}) or {}
+        ppn = pp.get("notional", n)   # 脚別実額。無ければ全量約定=notionalとみなす(旧行)
         pp_open_bps = pt if pp.get("taker_hedge") else pm
-        pp_fee = n * (pp_open_bps + pc) / 1e4
+        pp_fee = ppn * (pp_open_bps + pc) / 1e4
         tx_fee = max(0.0, r.get("fees_usd", 0) - pp_fee)  # 残りがtxflow脚fee
         pp_net = pp.get("pnl", 0) - pp_fee
         tx_net = tx.get("pnl", 0) - tx_fee
-        perpl["volume"] += n * 2; perpl["net"] += pp_net; perpl["n"] += 1
+        perpl["volume"] += ppn * 2; perpl["net"] += pp_net; perpl["n"] += 1
         txflow["volume"] += n * 2; txflow["net"] += tx_net; txflow["n"] += 1
     return {"perpl": perpl, "txflow": txflow}
+
+
+def _xvenue_by_symbol(rows) -> dict:
+    """xvenueは1サイクル1銘柄。symbol でそのまま分ける(2026-07-25以前の行はBTC後付け済み)。"""
+    out = {}
+    for r in rows:
+        a = out.setdefault(r.get("symbol", "BTC"), {"n": 0, "volume": 0.0, "net": 0.0, "fees": 0.0})
+        a["n"] += 1
+        a["volume"] += r.get("volume_usd", 0.0)
+        a["net"] += r.get("net_usd", 0.0)
+        a["fees"] += r.get("fees_usd", 0.0)
+    return out
+
+
+def _pair_hedge_by_symbol(rows) -> dict:
+    """pair_hedge の net を脚別の出来高比で按分する(モジュールdocstringの「銘柄別」参照)。
+
+    脚の出来高 = fills[symbol] の px×size×2(open+close)。fills が空のサイクル(両脚未約定)は
+    出来高ゼロなので配りようがなく、そのnetはどの銘柄にも計上しない — 台帳全体の合計とは
+    その分ズレる(戦略別の行が正)。"""
+    out = {}
+    for r in rows:
+        legs = {s: (f.get("px", 0) or 0) * (f.get("size", 0) or 0) * 2
+                for s, f in (r.get("fills") or {}).items()}
+        total = sum(legs.values())
+        if total <= 0:
+            continue
+        for s, vol in legs.items():
+            a = out.setdefault(s, {"n": 0, "volume": 0.0, "net": 0.0, "fees": 0.0})
+            share = vol / total
+            a["n"] += 1
+            a["volume"] += vol
+            a["net"] += r.get("net_usd", 0.0) * share
+            a["fees"] += r.get("fees_usd", 0.0) * share
+    return out
 
 
 def _eff_line(name: str, sub: str, a: dict) -> str:
@@ -100,11 +144,17 @@ def build_report() -> str:
     # --- 会場別(xvenueを按分して合流) ---
     # ★txflow-bot(ARB/HBAR)は2026-07-23退役。txflow会場は稼働中のxvenue txflow脚のみ集計する
     #   (退役した過去のARB/HBAR損失は前向き指標から外す。履歴は data/cycles.jsonl に残存)。
+    ph_rows = _read(PAIR_HEDGE_CYCLES, keep=lambda r: r.get("seq_lead") == "perpl:SOL")
     xvv = _xvenue_by_venue(xv_rows)
     perpl_venue = {"n": ph["n"] + xvv["perpl"]["n"],
                    "volume": ph["volume"] + xvv["perpl"]["volume"],
                    "net": ph["net"] + xvv["perpl"]["net"], "fees": ph["fees"]}
     txflow_venue = dict(xvv["txflow"], fees=0.0)
+
+    # --- 銘柄別 ---
+    by_sym = [(f"{s} (xvenue)", "txflow×perpl", a) for s, a in sorted(_xvenue_by_symbol(xv_rows).items())]
+    by_sym += [(f"{s.split(':')[-1]} (pair_hedge)", "出来高按分", a)
+               for s, a in sorted(_pair_hedge_by_symbol(ph_rows).items())]
 
     return (
         "【戦略別】\n"
@@ -112,7 +162,9 @@ def build_report() -> str:
         + _eff_line("xvenue-hedge", "txflow×perpl BTC", xv) + "\n\n"
         "【会場別】(xvenueは損益を脚別実額で分解=価格PnL+その脚のfee)\n"
         + _eff_line("perpl", "pair_hedge + xvenue perpl脚", perpl_venue) + "\n"
-        + _eff_line("txflow", "xvenue txflow脚(txflow-bot退役)", txflow_venue)
+        + _eff_line("txflow", "xvenue txflow脚(txflow-bot退役)", txflow_venue) + "\n\n"
+        "【銘柄別】(pair_hedgeは脚別PnLが分離できないので出来高按分)\n"
+        + "\n".join(_eff_line(name, sub, a) for name, sub, a in by_sym)
     )
 
 

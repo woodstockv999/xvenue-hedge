@@ -26,6 +26,7 @@ import sys
 import time
 import types
 from pathlib import Path
+from typing import Optional
 
 import yaml
 from dotenv import load_dotenv
@@ -148,6 +149,35 @@ class XVenueHedge:
         if p is not None:
             return p.get("szi", 0.0)
         return self.pp_exec.get_position_szi()
+
+    def _pp_feed_filled(self) -> Optional[float]:
+        """常駐口座WSから見た perpl 建玉の絶対サイズ。**handshake不要**。
+        feedが切断/陳腐化/スナップショット未達なら None(=判定不能、呼び側は従来経路へ)。
+
+        エントリーガードが「建玉ゼロを確認してから置く」不変条件を作っているので、resting保有中に
+        建玉があればそれはこのrestingの約定量そのもの(perpl_exchange._fill_from_position と同じ論法)。"""
+        p = self.pp_account.get_position(PERPL_MCFG["market_id"], PERPL_MCFG["price_decimals"],
+                                         PERPL_MCFG["size_decimals"])
+        return None if p is None else abs(p.get("szi") or 0.0)
+
+    def _pp_entry_blocked(self) -> bool:
+        """常駐WSだけで『エントリーを置けない』と断定できるか。**handshake不要**。
+
+        ★"置ける"の判断には使わない。feedは差分配信なので置いた直後の注文が未反映な窓があり、
+        不在の確認に使うと fail-open(二重建玉)になる。ここは**"置けない"方向にだけ**効かせる
+        非対称な使い方で、クリーン/判定不能なら False を返して従来どおり place_maker_resting の
+        ガード(取引所の正)に最終判断を委ねる。2026-07-25 の xvenue 429 は 277件がこのガードの
+        空振り(=どうせ弾かれる状況でhandshakeを焼いていた)だった。"""
+        mid = PERPL_MCFG["market_id"]
+        oids = self.pp_account.get_live_oids(mid)
+        if oids:
+            log(f"perpl 板に自分の指値が生存(feed) {sorted(oids)} → handshakeせず見送り")
+            return True
+        szi = self._pp_feed_filled()
+        if szi is not None and szi > 1e-8:
+            log(f"perpl 建玉が残っている(feed) szi={szi} → handshakeせず見送り")
+            return True
+        return False
 
     def _tx_marketable_px(self, is_buy: bool, bid: float, ask: float) -> float:
         """txflow taker IOC用の【確実約定価格】。touchちょうどだとBBO読取〜発注の間に板が
@@ -331,38 +361,51 @@ class XVenueHedge:
     def _perpl_maker_lead(self, is_buy: bool, size: float):
         """改善①②: perpl maker を先行させ requote しながら perpl_lead_timeout まで刺しにいく。
         戻り(filled, fill_px)。未約定は(False,None)。建玉=正でfill確認(false-negative対策)。
-        改善③: fillはpoll_maker_fill主・get_position_sziはrequote/timeout時のみ=perpl call削減。"""
+        改善④(2026-07-25): 約定検知と発注可否の先読みを**常駐口座WS**に寄せ、CF 1015の主因である
+        「1操作1接続」の認証WSハンドシェイクを削る。feedが古い/切断なら従来経路へフォールバック。"""
         plt = float(self.cfg["perpl_lead_timeout_seconds"])
         rq = float(self.cfg["requote_interval_seconds"])
         poll = float(self.cfg["poll_interval_seconds"])
+        grace = float(self.cfg.get("partial_grace_seconds", 5.0))
         since_ms = int(time.time() * 1000)
         deadline = time.time() + plt
-        oid, px, last_place = None, None, 0.0
+        oid, px, last_place, partial_since = None, None, 0.0, 0.0
         while time.time() < deadline:
             if oid is None:
+                if self._pp_entry_blocked():         # 常駐WSで先に見切る(handshakeを焼かない)
+                    return False, None
                 p_bid, p_ask = self._perpl_bbo()
                 px = p_bid if is_buy else p_ask       # maker: buyはbid/sellはaskにjoin
                 oid = self.pp_exec.place_maker_resting(is_buy, size, px, reduce_only=False)
-                last_place = time.time()
+                last_place, partial_since = time.time(), 0.0
                 if oid is None:
                     time.sleep(poll)
                     continue
-            f = self.pp_exec.poll_maker_fill(oid, since_ms)
-            if f:
-                fsz = float(f.get("sz") or 0.0)
+            # 約定検知は常駐口座WS(handshake不要)を主に。取れない/古いときだけ従来の
+            # poll_maker_fill(REST fills + 建玉フォールバックで1操作1接続)へ落とす。
+            fsz = self._pp_feed_filled()
+            if fsz is None:
+                f = self.pp_exec.poll_maker_fill(oid, since_ms)
+                fsz = float(f.get("sz") or 0.0) if f else 0.0
+            if fsz > 1e-8:
                 if fsz >= size * 0.999:
                     return True, px
-                log(f"perpl lead 部分約定 {fsz}/{size} → 残restingを取消し畳んで見送り")
-                self._pp_partial_abort(oid, is_buy, fsz)
-                return False, None
+                # 部分約定。常駐WSは約定を即時に見るので「まだ埋まりかけ」を掴むことがある
+                # (REST fillsのラグが今まで結果的にこれを均していた)。grace秒待って埋まらなければ見送る。
+                if not partial_since:
+                    partial_since = time.time()
+                    log(f"perpl lead 部分約定 {fsz}/{size} → {grace:.0f}s 様子見")
+                elif time.time() - partial_since >= grace:
+                    log(f"perpl lead 部分約定のまま {fsz}/{size} → 残restingを取消し畳んで見送り")
+                    self._pp_partial_abort(oid, is_buy, fsz)
+                    return False, None
             if time.time() - last_place >= rq:       # requote: touchが動いてたら置き直す
                 szi = abs(self._pp_szi())
                 if szi >= size * 0.999:              # requote前に建玉=正で確認
                     return True, px
-                if szi > 1e-8:                       # 部分約定。置き直さず畳む(残りは孤児化する)
-                    log(f"perpl lead 部分建玉 {szi}/{size} → 残restingを取消し畳んで見送り")
-                    self._pp_partial_abort(oid, is_buy, szi)
-                    return False, None
+                if szi > 1e-8:      # 部分約定中は置き直さない(残りが孤児化する)。
+                    time.sleep(poll)  # 見送るか待つかの判断は上のgrace付き分岐に一本化する
+                    continue
                 p_bid, p_ask = self._perpl_bbo()
                 new_px = p_bid if is_buy else p_ask
                 if new_px != px:

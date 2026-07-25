@@ -31,6 +31,7 @@ poll_interval_seconds: 5          # fills RESTポーリング間隔。5s=45sリ�
 # 429緩和(2026-07-23): BBOはget_context(CF保護REST)を毎回叩く→短TTLキャッシュで畳む。
 perpl_bbo_ttl_seconds: 2.0
 # CF 1015(IPレート制限)検出時は即再突入せずエスカレート待機(バンを延ばさない)。clean cycleで解除。
+partial_grace_seconds: 5       # 常駐WSは約定を即時に見るので「埋まりかけ」を部分約定と誤らないための様子見(2026-07-25)
 skip_streak_backoff_after: 5   # 見送りが何連続したらバックオフを効かせるか(2026-07-25: 309連続見送りで6.5h停止した対策)
 rl_backoff_base_seconds: 30
 rl_backoff_cap_seconds: 240

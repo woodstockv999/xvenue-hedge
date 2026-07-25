@@ -252,6 +252,17 @@ class XVenueHedge:
         fee = sum(float(f.get("fee", 0)) for f in matched)
         return {"px": px, "sz": sz, "fee": fee}
 
+    def _tx_order_alive(self, oid) -> bool:
+        """oid がまだ txflow の板に生存しているか。**取消の空振りを検知する**ために使う
+        (2026-07-25)。取得失敗は True(=生存扱い)を返す — 読めないときに「消えた」と判断すると
+        同じ脚を二重発注して建玉2倍化を招くので、fail-closed 側に倒す。"""
+        if not isinstance(oid, int):
+            return False
+        try:
+            return any(int(o.get("oid", -1)) == oid for o in (self.tx.get_open_orders() or []))
+        except Exception:
+            return True
+
     def _tx_position(self) -> float:
         """txflow の対象銘柄の符号付き建玉(取引所の正)。失敗は例外(fail-closed用に呼び側で扱う)。
         ★銘柄はself.symbol依存(2026-07-24: BTCハードコードがHYPE切替で常に0.0を返し裸txflowを量産した)。"""
@@ -511,18 +522,31 @@ class XVenueHedge:
         tx_fill, tx_taker, mpx = None, False, (t_bid if tx_is_buy else t_ask)
 
         # --- ① 短時間 maker試行(post_only + requote。建玉で裏取り) ---
+        # ★取消×約定レース防御(2026-07-25。pair_hedge が 2026-07-12 の事故で入れた多層防御の移植):
+        #   旧コードは cancel を try/except:pass で撃ちっぱなしにし、**空振りでも ident を捨てて
+        #   次の reduce_only=False を置いていた**。両方刺さると建玉2倍=片方が裸デルタになる
+        #   (07-25 17:36 に `startup_reconcile: txflow 0.0046 をフラット化`=2×size で実観測)。
+        #   不変条件を2つ課す: (a)生きた指値を同時に2本持たない (b)過去identの約定も必ず回収する。
         ident, last_place, hdl = None, 0.0, time.time() + htry
+        open_idents = []          # このサイクルでopenに使った全ident(取消空振り分の回収用)
+        cancel_pending = False    # 取消を送ったが板から消えたことを未確認=**再発注してはいけない**
         while time.time() < hdl:
-            if ident is None:
+            if ident is None and not cancel_pending:
                 t_bid, t_ask = self._txflow_bbo()
                 mpx = t_bid if tx_is_buy else t_ask     # maker join(buy@bid/sell@ask)
                 ident = self._tx_place_maker(tx_is_buy, mpx, size, reduce_only=False)
                 last_place = time.time()
                 if ident is None:                        # post_only拒否等→takerへ
                     break
-            fl = self._tx_fill(ident, size)
-            if fl:
-                tx_fill = fl; break
+                open_idents.append(ident)
+            # 約定回収は**現行identだけでなく過去identも**見る(取消が空振りして古い方が刺さる)。
+            for cand in reversed(open_idents):
+                fl = self._tx_fill(cand, size)
+                if fl:
+                    tx_fill = fl
+                    break
+            if tx_fill:
+                break
             try:
                 if abs(self._tx_position()) >= size * 0.5:  # fills遅延→建玉で裏取り
                     tx_fill = {"px": mpx, "sz": size,
@@ -530,47 +554,98 @@ class XVenueHedge:
                     ident = None; break
             except Exception:
                 pass
-            if time.time() - last_place >= frq:          # touch移動→置き直し
-                if isinstance(ident, int):
-                    try:
-                        self.tx.cancel_order(self.symbol, ident)
-                    except Exception:
-                        pass
-                ident = None
+            if ident is not None and not cancel_pending and time.time() - last_place >= frq:
+                try:                                     # touch移動→置き直し(まず取消を送る)
+                    self.tx.cancel_order(self.symbol, ident)
+                except Exception:
+                    pass
+                cancel_pending = True                    # 消えたと**確認できるまで**次を置かない
+            if cancel_pending:
+                if self._tx_order_alive(ident):
+                    log(f"txflow open: 取消未成立(oid={ident})=再発注せず次tickで再確認")
+                else:
+                    ident, cancel_pending = None, False   # 板から消えた=安全に置き直せる
             time.sleep(0.5)
 
         # --- ② maker不成立 → taker で確実ヘッジ(裸窓を閉じる) ---
         if not tx_fill:
+            # 残resting指値を取消し、**消えたことを確認**してから残量を測る(生きたままだと
+            # taker と同時に刺さって2倍化する)。
             if isinstance(ident, int):
                 try:
                     self.tx.cancel_order(self.symbol, ident)
                 except Exception:
                     pass
+                for _ in range(6):                       # 取消反映を待つ(空振りなら生存し続ける)
+                    if not self._tx_order_alive(ident):
+                        break
+                    time.sleep(0.5)
+                else:
+                    log(f"⚠️ txflow open: 取消未成立のまま(oid={ident})。残量計算は建玉で行う")
+            # 取消の直前に刺さっていた可能性を必ず回収する(過去ident全部)。
+            for cand in reversed(open_idents):
+                fl = self._tx_fill(cand, size)
+                if fl:
+                    tx_fill = fl
+                    break
+        if not tx_fill:
+            # ★全量IOCではなく**残量だけ**を撃つ。旧コードは既約定分の上に size を積んでいた
+            #   (maker が刺さっていたのに fills 未反映だと 2×size になる)。
+            pos0 = 0.0
+            try:
+                pos0 = abs(self._tx_position())
+            except Exception:
+                pass
+            remaining = round(size - pos0, self._size_round)
             t_bid, t_ask = self._txflow_bbo()
             tx_touch = t_ask if tx_is_buy else t_bid
-            tx_px = self._tx_marketable_px(tx_is_buy, t_bid, t_ask)  # 板移動許容バッファ付き
-            tx_taker = True
-            try:
-                self.tx.place_limit_order(self.symbol, tx_is_buy, tx_px, size,
-                                          reduce_only=False, tif=self.tx.TIF_IOC)
-            except Exception as e:
-                log(f"⚠️ txflow追従taker失敗({repr(e)[:50]})")
-            pos = 0.0
-            for _ in range(6):                          # 建玉反映ラグ吸収(偽hedge_fail防止)
-                time.sleep(0.5)
+            if remaining <= size * 0.05:                 # 既に埋まっている=takerを撃たない
+                log(f"txflow open: 既に建玉{pos0}(≒size)=taker不要。maker約定として計上")
+                tx_fill = {"px": mpx, "sz": pos0,
+                           "fee": self.notional * self.fees["txflow_maker_bps"] / 1e4}
+            else:
+                tx_px = self._tx_marketable_px(tx_is_buy, t_bid, t_ask)  # 板移動許容バッファ付き
+                tx_taker = True
                 try:
-                    pos = self._tx_position()
-                except Exception:
-                    continue
-                if abs(pos) >= size * 0.5:
-                    break
-            if abs(pos) < size * 0.5:                   # ヘッジ不成立→perpl脚unwind(裸回避)
-                log("⚠️ txflowヘッジ不成立→perpl脚をunwind(裸回避)")
-                self._perpl_unwind(perpl_is_buy, size)
-                self.dirty = True                        # 裸残の疑い→次ループでflatten確認
-                return {"skip": "hedge_failed_unwound"}
-            tx_fill = {"px": tx_touch, "sz": abs(pos),
-                       "fee": self.notional * self.fees["txflow_taker_bps"] / 1e4}
+                    self.tx.place_limit_order(self.symbol, tx_is_buy, tx_px, remaining,
+                                              reduce_only=False, tif=self.tx.TIF_IOC)
+                except Exception as e:
+                    log(f"⚠️ txflow追従taker失敗({repr(e)[:50]})")
+                pos = 0.0
+                for _ in range(6):                      # 建玉反映ラグ吸収(偽hedge_fail防止)
+                    time.sleep(0.5)
+                    try:
+                        pos = self._tx_position()
+                    except Exception:
+                        continue
+                    if abs(pos) >= size * 0.5:
+                        break
+                if abs(pos) < size * 0.5:               # ヘッジ不成立→perpl脚unwind(裸回避)
+                    log("⚠️ txflowヘッジ不成立→perpl脚をunwind(裸回避)")
+                    self._perpl_unwind(perpl_is_buy, size)
+                    self.dirty = True                    # 裸残の疑い→次ループでflatten確認
+                    return {"skip": "hedge_failed_unwound"}
+                # maker約定分(pos0)と taker約定分(残量)の混成なので手数料も按分する。
+                mk = self.notional * (pos0 / size) * self.fees["txflow_maker_bps"] / 1e4
+                tk = self.notional * (min(remaining, abs(pos)) / size) * self.fees["txflow_taker_bps"] / 1e4
+                tx_fill = {"px": tx_touch, "sz": abs(pos), "fee": mk + tk}
+        # ★超過建玉ガード: 上の防御を抜けても size を超えていたら**その場で削る**
+        #   (perpl脚は size しかヘッジしていないので、超過分はそのまま裸デルタになる)。
+        try:
+            pos_chk = self._tx_position()
+        except Exception:
+            pos_chk = 0.0
+        excess = round(abs(pos_chk) - size, self._size_round)
+        if excess > size * 0.05:
+            log(f"⚠️ txflow open: 建玉超過 {abs(pos_chk)} > size {size} → 超過{excess}をreduce-onlyで削る")
+            try:
+                t_b, t_a = self._txflow_bbo()
+                self.tx.place_limit_order(self.symbol, pos_chk < 0,
+                                          self._tx_marketable_px(pos_chk < 0, t_b, t_a),
+                                          excess, reduce_only=True, tif=self.tx.TIF_IOC)
+            except Exception as e:
+                log(f"⚠️ txflow超過削り失敗({repr(e)[:50]})=次ループでflatten")
+                self.dirty = True
 
         # === HOLD ===
         time.sleep(float(self.cfg["hold_seconds"]))

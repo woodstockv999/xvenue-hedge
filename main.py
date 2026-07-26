@@ -461,6 +461,24 @@ class XVenueHedge:
         """起動時に両会場の対象銘柄をフラット化(mid-cycle再起動での建玉残存/2倍化を防ぐ)。dry_runは無処理。"""
         if self.dry_run:
             return
+        # ★perpl BTC: **建玉を畳む前に**残存指値を取消す(2026-07-26追加)。
+        #   ここが抜けていたため、_pp_cancel_verified が3回失敗して resting が板に残ると
+        #   _entry_preconditions_ok(fail-closed)が以降の全エントリーを拒否し、**再起動しても
+        #   _startup_reconcile がその指値を触らないので状態が引き継がれ、永久にサイクル0**
+        #   になっていた。回復は「指値がいつか約定/失効する」か手動取消のみ=恒久デッドロック。
+        #   txflow 側は最初から get_open_orders→cancel_order を回しており、perpl 側だけの抜け。
+        #   順序が重要: 先に建玉を畳むと、残った指値が直後に約定して建玉が復活しうる。
+        try:
+            live = self.pp_exec.list_open_maker_orders()
+            if live is None:      # 取得失敗(429等)。fail-closed で「消せた」とみなさない
+                log("⚠️ startup_reconcile perpl 残存指値を読めず(429?)=取消を見送る")
+            else:
+                for _sym, oid in live:
+                    if not self._pp_cancel_verified(int(oid)):
+                        log(f"⚠️ startup_reconcile perpl oid={oid} を取消せない"
+                            f"=以降のエントリーがガードで拒否される(手動取消要)")
+        except Exception as e:
+            log(f"⚠️ startup_reconcile perpl 指値取消失敗={repr(e)[:50]}")
         # perpl BTC: 生の建玉(fail-openしない)を読んで方向付きで畳む
         try:
             pos = self.pp_exec._fetch_position()

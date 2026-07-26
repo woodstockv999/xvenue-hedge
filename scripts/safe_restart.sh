@@ -64,7 +64,11 @@ fi
 
 # 3. 再起動。
 mark=$(wc -l < "$LOG" 2>/dev/null || echo 0)   # 起動後ログだけを見るための基準行
-pm2 restart xvenue-hedge
+# ★`pm2 restart <name>` ではなく ecosystem を読み直す(2026-07-26)。前者は pm2 がキャッシュした
+#   起動設定を使い回すため、ecosystem.config.js の変更(interpreter / min_uptime / env)が
+#   **黙って無効化される**。実際に interpreter を hlbot-sandbox venv から
+#   apps/hyperliquid-bot venv へ移した際、restart では旧 venv のまま起動し続けた。
+pm2 startOrRestart "$APP/ecosystem.config.js"
 sleep 12                                        # startup_reconcile が一巡する余裕
 
 # 4. 起動後チェック。**この再起動で出た行だけ**を見る(前回分を拾ってオオカミ少年になるのを防ぐ)。

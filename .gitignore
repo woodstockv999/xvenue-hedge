@@ -1,6 +1,14 @@
 __pycache__/
 *.pyc
-data/*.jsonl
-data/*.json
+# data/ はディレクトリごと除外する。旧 `data/*.jsonl` は
+# `cycles.jsonl.20260724-prereset` のような接尾辞付きバックアップにマッチせず、
+# public リポへ取引履歴が載る穴になっていた(2026-07-26 監査)。
+data/
 .env
-.env.local
+.env.*
+!.env.example
+*.bak
+*.save
+*~
+*.db
+*.log

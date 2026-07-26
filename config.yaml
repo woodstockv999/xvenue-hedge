@@ -73,6 +73,17 @@ efficiency_min_volume_usd: 1000   # efficiency_floor が0の間は未使用。�
 loss_budget_usd: 200    # セル累積net。バグ由来の暴走(想定外サイズ・脚放置の連鎖)にだけ効く
                         # 外側の弁。口座を守るのは上の account_guard_24h_usd。
 
+# ★txflow 口座の証拠金下限(2026-07-27追加)。それまで main.py に balance 参照が1つも無く、
+#   $26/日 燃やしている口座の残高を誰も見ていなかった(監査 C-5)。account_guard_24h_usd は
+#   両セルの**セルnet**を合算するもので、口座残高そのものは perpl 側も txflow 側も未監視。
+#   必要証拠金 = notional 150 / leverage 3 = $50 が床。実測 07-27 07:00 の equity は
+#   $103.78(建玉フラット)なので、バッファを載せて 55 で止める。
+txflow_min_equity_usd: 55
+# hold 中に txflow 建玉の超過を確認する間隔(秒)。open 直後の1回きりのガードでは
+# 取消×約定レースで数秒遅れて刺さる2本目を見逃していた(全ログで「建玉超過」発火0件)。
+# hold を延ばす方針では露出時間がそのまま伸びるので、hold 中も定期確認して削る。
+hold_position_check_seconds: 30
+
 # 実測接地の手数料(bps)。txflow=cycles.jsonl逆算、perpl=exchange docstring。
 fees:
   txflow_maker_bps: 1.5

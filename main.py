@@ -133,6 +133,7 @@ class XVenueHedge:
         self._pp_bbo_ttl = float(cfg.get("perpl_bbo_ttl_seconds", 2.0))
         self._rl_backoff = 0.0                          # perpl 429時のエスカレート待機(clean cycleで0へ)
         self._skip_streak = 0                           # 連続見送り数。詰まったまま叩き続ける自己増幅429を止める
+        self._tx_eq_cache = (0.0, None)                 # (monotonic, txflow accountValue) 60s TTL
         self._load_ledger()
 
     def _load_ledger(self) -> None:
@@ -163,6 +164,25 @@ class XVenueHedge:
         if p is not None:
             return p.get("szi", 0.0)
         return self.pp_exec.get_position_szi()
+
+    def _pp_szi_strict(self) -> Optional[float]:
+        """符号付き建玉。**読めなければ None**(fail-open しない)。0.0 は『確認できたフラット』。
+
+        _pp_szi は 429 等で 0.0 を返す契約なので「建玉が無い」の判断には使えない。close 判定に
+        使うと、建玉が残っているのに close を飛ばし、さらに約定価格として BBO 中値(架空値)を
+        台帳に書く二重障害になる(2026-07-27 N-2)。"""
+        p = self.pp_account.get_position(PERPL_MCFG["market_id"], PERPL_MCFG["price_decimals"],
+                                         PERPL_MCFG["size_decimals"])
+        if p is not None:
+            return p.get("szi", 0.0)
+        try:
+            pos = self.pp_exec._fetch_position()      # fail-closed(読めなければ例外)
+        except Exception:
+            return None
+        if pos is None:
+            return 0.0
+        sz = _pe.scaled_to_size(int(pos["s"]), self.pp_market.size_decimals)
+        return sz if pos.get("sd") == 1 else -sz
 
     def _pp_feed_filled(self) -> Optional[float]:
         """常駐口座WSから見た perpl 建玉の絶対サイズ。**handshake不要**。
@@ -264,16 +284,39 @@ class XVenueHedge:
         fee = sum(float(f.get("fee", 0)) for f in matched)
         return {"px": px, "sz": sz, "fee": fee}
 
+    def _tx_resolve_oid(self, ident) -> Optional[int]:
+        """ident(int または {"cloid":...})から板上の oid を引く。板に無ければ None。
+        cloid でしか同定できていない指値を取消すために必要(2026-07-27)。"""
+        if isinstance(ident, int):
+            return ident
+        if isinstance(ident, dict) and ident.get("cloid"):
+            try:
+                for o in (self.tx.get_open_orders() or []):
+                    if o.get("cloid") == ident["cloid"]:
+                        return int(o["oid"])
+            except Exception:
+                return None
+        return None
+
     def _tx_order_alive(self, oid) -> bool:
-        """oid がまだ txflow の板に生存しているか。**取消の空振りを検知する**ために使う
+        """ident がまだ txflow の板に生存しているか。**取消の空振りを検知する**ために使う
         (2026-07-25)。取得失敗は True(=生存扱い)を返す — 読めないときに「消えた」と判断すると
-        同じ脚を二重発注して建玉2倍化を招くので、fail-closed 側に倒す。"""
-        if not isinstance(oid, int):
-            return False
+        同じ脚を二重発注して建玉2倍化を招くので、fail-closed 側に倒す。
+
+        ★2026-07-27: 非int を一律 False(=消えた)で返しており docstring と矛盾していた。これが
+          建玉2倍化の実経路。_tx_place_maker は openOrders に1.8秒出てこないと {"cloid":...} を
+          返すので、requote 分岐で cancel_order(dict) が例外→握り潰し→ここが False→「板から
+          消えた」と誤判定して再発注、で2本が同時に生きる(07-26 23:18 / 07-27 05:12 に実測)。
+          openOrders は cloid を持つ(_tx_place_maker が同定に使っている)ので cloid でも照合する。"""
         try:
-            return any(int(o.get("oid", -1)) == oid for o in (self.tx.get_open_orders() or []))
+            orders = self.tx.get_open_orders() or []
         except Exception:
-            return True
+            return True                       # 読めない=生存扱い(fail-closed)
+        if isinstance(oid, int):
+            return any(int(o.get("oid", -1)) == oid for o in orders)
+        if isinstance(oid, dict) and oid.get("cloid"):
+            return any(o.get("cloid") == oid["cloid"] for o in orders)
+        return True                           # 判定不能=生存扱い(fail-closed)
 
     def _tx_position(self) -> float:
         """txflow の対象銘柄の符号付き建玉(取引所の正)。失敗は例外(fail-closed用に呼び側で扱う)。
@@ -285,6 +328,23 @@ class XVenueHedge:
             if str(pos["coin"]).split("-")[0].upper() == sym:
                 return float(pos.get("szi", 0))
         return 0.0
+
+    def _tx_equity(self, ttl: float = 60.0) -> Optional[float]:
+        """txflow 口座の accountValue(USD)。ttl 秒キャッシュ。読めなければ直近値(無ければ None)。
+
+        ★2026-07-27追加: それまで main.py に balance 参照が1つも無く、$26/日 燃やしている口座の
+          残高を誰も見ていなかった。証拠金の床(notional/leverage)に当たると発注が通らなくなる。"""
+        now = time.monotonic()
+        ts, val = self._tx_eq_cache
+        if val is not None and now - ts < ttl:
+            return val
+        try:
+            chs = self.tx.get_clearinghouse_state(self.tx.main_address)
+            v = float((chs.get("marginSummary") or {}).get("accountValue"))
+        except Exception:
+            return val                        # 読めない=直近値のまま(読めないことでハルトさせない)
+        self._tx_eq_cache = (now, v)
+        return v
 
     def _tx_unwind(self, opened_is_buy: bool, size: float) -> None:
         """txflow脚を建玉(=正)からtaker IOCで即クローズ(ヘッジ失敗時の裸回避)。"""
@@ -578,23 +638,41 @@ class XVenueHedge:
             if tx_fill:
                 break
             try:
-                if abs(self._tx_position()) >= size * 0.5:  # fills遅延→建玉で裏取り
-                    tx_fill = {"px": mpx, "sz": size,
+                # ★0.5 では半分しか刺さっていなくても「全量約定」として size を計上していた
+                #   (2026-07-27 N-1修正)。perpl は size 全量をヘッジ済みなので、差分がそのまま
+                #   hold 中ずっと裸デルタになる。perpl 側の判定(0.999)と揃える。未達なら下の
+                #   taker フォールバックが remaining だけを埋める。
+                pos_m = abs(self._tx_position())
+                if pos_m >= size * 0.999:                # fills遅延→建玉で裏取り
+                    tx_fill = {"px": mpx, "sz": pos_m,
                                "fee": self.notional * self.fees["txflow_maker_bps"] / 1e4}
                     ident = None; break
             except Exception:
                 pass
             if ident is not None and not cancel_pending and time.time() - last_place >= frq:
-                try:                                     # touch移動→置き直し(まず取消を送る)
-                    self.tx.cancel_order(self.symbol, ident)
-                except Exception:
-                    pass
+                # ★ident が cloid dict(openOrders に1.8s出てこなかった)のときは oid が無く
+                #   cancel_order を呼べない。旧コードは例外を握り潰したまま再発注へ進み、
+                #   板に載っていた場合に2本同時生存=建玉2倍になった(2026-07-27修正)。
+                oid_c = self._tx_resolve_oid(ident)
+                if oid_c is None:
+                    log("txflow open: identのoid未解決(cloid未反映)=requoteせず約定回収に委ねる")
+                else:
+                    try:                                 # touch移動→置き直し(まず取消を送る)
+                        self.tx.cancel_order(self.symbol, oid_c)
+                    except Exception:
+                        pass
                 cancel_pending = True                    # 消えたと**確認できるまで**次を置かない
             if cancel_pending:
                 if self._tx_order_alive(ident):
                     log(f"txflow open: 取消未成立(oid={ident})=再発注せず次tickで再確認")
                 else:
-                    ident, cancel_pending = None, False   # 板から消えた=安全に置き直せる
+                    # 板から消えた。**約定していないことを確認してから**置き直す
+                    # (消えた理由が「約定」なら再発注はそのまま建玉2倍になる)。
+                    fl_gone = self._tx_fill(ident, size)
+                    if fl_gone:
+                        tx_fill = fl_gone
+                        break
+                    ident, cancel_pending = None, False   # 未約定で消えた=安全に置き直せる
             time.sleep(0.5)
 
         # --- ② maker不成立 → taker で確実ヘッジ(裸窓を閉じる) ---
@@ -648,10 +726,34 @@ class XVenueHedge:
                         pos = self._tx_position()
                     except Exception:
                         continue
-                    if abs(pos) >= size * 0.5:
+                    if abs(pos) >= size * 0.999:
                         break
-                if abs(pos) < size * 0.5:               # ヘッジ不成立→perpl脚unwind(裸回避)
-                    log("⚠️ txflowヘッジ不成立→perpl脚をunwind(裸回避)")
+                # ★部分約定なら残量をもう一度だけ taker で埋める(2026-07-27 N-1)。旧コードは
+                #   size*0.5 で「ヘッジ成立」と見なしており、残り最大50%が hold 中ずっと裸だった。
+                if 1e-8 < abs(pos) < size * 0.999:
+                    rem2 = round(size - abs(pos), self._size_round)
+                    if rem2 > 0:
+                        log(f"txflow追従taker 部分約定 {abs(pos)}/{size} → 残{rem2}を再taker")
+                        try:
+                            t_b2, t_a2 = self._txflow_bbo()
+                            self.tx.place_limit_order(
+                                self.symbol, tx_is_buy,
+                                self._tx_marketable_px(tx_is_buy, t_b2, t_a2),
+                                rem2, reduce_only=False, tif=self.tx.TIF_IOC)
+                        except Exception as e:
+                            log(f"⚠️ txflow追従taker再送失敗({repr(e)[:50]})")
+                        for _ in range(6):
+                            time.sleep(0.5)
+                            try:
+                                pos = self._tx_position()
+                            except Exception:
+                                continue
+                            if abs(pos) >= size * 0.999:
+                                break
+                if abs(pos) < size * 0.999:             # ヘッジ不成立→両脚を畳む(裸回避)
+                    log(f"⚠️ txflowヘッジ不成立({abs(pos)}/{size})→両脚をunwind(裸回避)")
+                    if abs(pos) > 1e-8:
+                        self._tx_unwind(tx_is_buy, abs(pos))   # txflow の部分建玉も残さない
                     self._perpl_unwind(perpl_is_buy, size)
                     self.dirty = True                    # 裸残の疑い→次ループでflatten確認
                     return {"skip": "hedge_failed_unwound"}
@@ -677,8 +779,35 @@ class XVenueHedge:
                 log(f"⚠️ txflow超過削り失敗({repr(e)[:50]})=次ループでflatten")
                 self.dirty = True
 
-        # === HOLD ===
-        time.sleep(float(self.cfg["hold_seconds"]))
+        # === HOLD(超過建玉を定期監視) ===
+        # ★open直後の超過ガードは1回しか走らず、取消×約定レースで2本目が数秒遅れて刺さると
+        #   見逃していた(全ログで「建玉超過」の発火0件)。perpl は size しかヘッジしていないので
+        #   超過分は hold 中ずっと裸デルタになる。hold を延ばす方針(OI/保有時間を積む)では
+        #   露出時間がそのまま伸びるため、hold 中も定期的に確認して削る(2026-07-27)。
+        hold_end = time.time() + float(self.cfg["hold_seconds"])
+        chk_s = float(self.cfg.get("hold_position_check_seconds", 30))
+        while True:
+            remain_h = hold_end - time.time()
+            if remain_h <= 0:
+                break
+            time.sleep(min(chk_s, remain_h))
+            if time.time() >= hold_end:
+                break
+            try:
+                pos_h = self._tx_position()
+            except Exception:
+                continue
+            ex_h = round(abs(pos_h) - size, self._size_round)
+            if ex_h > size * 0.05:
+                log(f"⚠️ hold中に txflow 建玉超過 {abs(pos_h)} > size {size} → 超過{ex_h}を削る")
+                try:
+                    t_bh, t_ah = self._txflow_bbo()
+                    self.tx.place_limit_order(self.symbol, pos_h < 0,
+                                              self._tx_marketable_px(pos_h < 0, t_bh, t_ah),
+                                              ex_h, reduce_only=True, tif=self.tx.TIF_IOC)
+                except Exception as e:
+                    log(f"⚠️ hold中の超過削り失敗({repr(e)[:50]})=次ループでflatten")
+                    self.dirty = True
 
         # === CLOSE: txflow reduce(maker→taker) + perpl reduce-only ===
         tx_close_buy = not tx_is_buy
@@ -741,13 +870,31 @@ class XVenueHedge:
                                 "fee": self.notional * self.fees["txflow_maker_bps"] / 1e4,
                                 "recovered": False}
         # perpl reduce-only close(reduce≈無料・確実)
-        pp_szi = self._pp_szi()
+        # ★_pp_szi は fail-open(429で0.0)。これを「建玉なし」と読むと close を丸ごと飛ばした
+        #   うえで pp_close_px に BBO 中値(架空値)を書く二重障害になっていた(2026-07-27 N-2)。
+        #   方向は open 時点で確定しているので、読めないときも reduce_only で畳みにいく
+        #   (reduce_only は建玉方向にしか約定しない=flat なら no-op なので安全)。
+        pp_szi = self._pp_szi_strict()
         p_bid, p_ask = self._perpl_bbo()
-        pp_close_px = (p_bid + p_ask) / 2
-        if abs(pp_szi) > 1e-8:
-            r = self.pp_exec.place_order(pp_szi < 0, abs(pp_szi), "close", reduce_only=True)
+        pp_close_px, pp_close_ok = None, True
+        if pp_szi is None:
+            log("⚠️ perpl close: 建玉を読めず → open方向から reduce_only で畳む(fail-closed)")
+            close_sz = size
+        else:
+            close_sz = abs(pp_szi) if abs(pp_szi) > 1e-8 else 0.0
+        if close_sz > 1e-8:
+            close_is_buy = (pp_szi < 0) if pp_szi is not None else (not perpl_is_buy)
+            r = self.pp_exec.place_order(close_is_buy, close_sz, "close", reduce_only=True)
             if isinstance(r, dict) and r.get("price"):
                 pp_close_px = float(r["price"])
+        else:
+            log("⚠️ perpl close: open約定後に建玉が消えている(確認済みflat)")
+            self.dirty = True
+        if pp_close_px is None:
+            # 約定価格を取れない。BBO 中値は**架空値**なので、捏造せず旗を立てて記録に残す。
+            pp_close_px = (p_bid + p_ask) / 2
+            pp_close_ok = False
+            self.dirty = True
 
         # === 損益(long=close-open / short=open-close) ===
         tx_o, tx_c = tx_fill["px"], tx_cfill["px"]
@@ -760,12 +907,16 @@ class XVenueHedge:
         return {
             "ts": round(time.time(), 3), "symbol": self.symbol, "dir_buy": dir_buy, "dry_run": False,
             "size": size, "notional_usd": self.notional,
-            "txflow": {"open": tx_o, "close": tx_c, "pnl": round(tx_pnl, 5), "taker_follow": tx_taker},
+            "txflow": {"open": tx_o, "close": tx_c, "pnl": round(tx_pnl, 5), "taker_follow": tx_taker,
+                       # 実約定を回収できたか。False=close価格が touch 近似(2026-07-27: 旗自体は
+                       # 作っていたのに記録dictに載せておらず、後から該当行を除外できなかった)。
+                       "close_recovered": bool(tx_cfill.get("recovered", True))},
             # size/notional は脚別の実額。銘柄別・会場別の集計が全量約定を前提にしないためのもの
             # (2026-07-25: 部分約定を全量計上して台帳が汚れた実害の再発防止)。
             "perpl": {"open": round(pp_open_px, 1), "close": round(pp_close_px, 1),
                       "pnl": round(pp_pnl, 5), "taker_hedge": False,
-                      "size": size, "notional": round(pp_open_px * size, 4)},
+                      "size": size, "notional": round(pp_open_px * size, 4),
+                      "close_recovered": pp_close_ok},
             "fees_usd": round(fees, 6), "volume_usd": round(self.notional * 4, 4), "net_usd": round(net, 6),
         }
 
@@ -791,6 +942,9 @@ class XVenueHedge:
             # 未フラット疑いで新規サイクルを止めている状態。halted とは別(自己修復しうる)。
             "dirty": self.dirty,
             "dirty_since_ts": int(self.dirty_since) if self.dirty and self.dirty_since else None,
+            # txflow 口座残高(2026-07-27追加)。60秒キャッシュ経由なので status を書く頻度で
+            # API を叩くことはない。外側の監視がこの1点だけで証拠金枯渇を見られるようにする。
+            "txflow_equity_usd": (None if self.dry_run else self._tx_equity()),
         }, indent=2))
         return eff
 
@@ -833,6 +987,14 @@ class XVenueHedge:
         guard = _pag.halt_reason(float(self.cfg.get("account_guard_24h_usd", 0) or 0))
         if guard:
             return guard
+        # 1b. txflow 口座の証拠金(2026-07-27追加)。account_guard は両セルの**セルnet**を合算する
+        #     ものなので perpl 口座も txflow 口座も残高としては見ていない。txflow は
+        #     必要証拠金(notional/leverage)を割ると発注が通らなくなるだけで、誰も気づかない。
+        min_eq = float(self.cfg.get("txflow_min_equity_usd", 0) or 0)
+        if min_eq > 0 and not self.dry_run:
+            eq = self._tx_equity()
+            if eq is not None and eq < min_eq:
+                return f"txflow equity ${eq:.2f} < 下限 ${min_eq:.2f}(証拠金の床)"
         if self.cum_net <= -float(self.cfg["loss_budget_usd"]):
             return (f"loss_budget${self.cfg['loss_budget_usd']}超過"
                     f"(net=${self.cum_net:.3f})")

@@ -125,6 +125,9 @@ class XVenueHedge:
         self.halted = False
         self.halted_reason = ""
         self.dirty = False  # cycle例外後の未フラット疑い。両会場flat確認まで新規サイクルを止める
+        # dirty に入った時刻(status.json 経由で外側に継続時間を見せる用)。dirty=True の代入は
+        # 7箇所に散っているので、そこは触らず **loop() 側で一元管理**する。
+        self.dirty_since: Optional[float] = None
         self._pp_bbo_cache = None                       # (monotonic時刻, (bid,ask)) 429緩和のBBO短TTL
         self._pp_bbo_ttl = float(cfg.get("perpl_bbo_ttl_seconds", 2.0))
         self._rl_backoff = 0.0                          # perpl 429時のエスカレート待機(clean cycleで0へ)
@@ -770,7 +773,13 @@ class XVenueHedge:
 
         ★_record からだけでなく**ハルト時にも呼ぶ** — 2026-07-25、_record 経由でしか書いていな
         かったため loss_budget ハルト後も `halted: false` のまま status が固まり、45分の停止を
-        外から検知できずユーザーの目視で見つかった(cycleが止まる=statusも止まる、が盲点)。"""
+        外から検知できずユーザーの目視で見つかった(cycleが止まる=statusも止まる、が盲点)。
+
+        ★2026-07-26: **dirty 再試行ループ**も同じ盲点だった。_reconcile_dirty が perpl 429 で
+        失敗し続ける間、この関数が呼ばれないので `halted: false` のまま updated_ts が最後の
+        完走サイクル時刻で固まり「稼働中に見える停止」になる。呼び出しを追加したうえで、
+        単に updated_ts を進めるだけでは鮮度監視をすり抜けるので `dirty` / `dirty_since_ts` を
+        status に出し、外側(halt_monitor.py)がその継続時間で判定できるようにする。"""
         eff = (self.cum_volume / abs(self.cum_net)) if self.cum_net < 0 else None
         STATUS_PATH.write_text(json.dumps({
             "updated_ts": int(time.time()), "dry_run": self.dry_run, "halted": self.halted,
@@ -778,6 +787,9 @@ class XVenueHedge:
             "cycles": self.cycles, "cum_volume_usd": round(self.cum_volume, 2),
             "cum_fees_usd": round(self.cum_fees, 4), "cum_net_usd": round(self.cum_net, 4),
             "efficiency": round(eff, 1) if eff else None,
+            # 未フラット疑いで新規サイクルを止めている状態。halted とは別(自己修復しうる)。
+            "dirty": self.dirty,
+            "dirty_since_ts": int(self.dirty_since) if self.dirty and self.dirty_since else None,
         }, indent=2))
         return eff
 
@@ -840,11 +852,20 @@ class XVenueHedge:
                 continue
             # cycle例外後は新規サイクルより先に両会場をフラット化(裸脚の上に建てない)
             if self.dirty and not self.dry_run:
+                if self.dirty_since is None:
+                    self.dirty_since = time.time()
                 if self._reconcile_dirty():
                     self.dirty = False
+                    self.dirty_since = None
                     log("error後reconcile: 両会場フラット確認。稼働再開")
+                    self._write_status()
                 else:
-                    log("⚠️ error後reconcile未完(両会場flat未確認)=次ループで再試行")
+                    stuck = time.time() - self.dirty_since
+                    log(f"⚠️ error後reconcile未完(両会場flat未確認、{stuck:.0f}s継続)=次ループで再試行")
+                    # ★status を必ず書く(2026-07-26)。ここを書かないと halted:false のまま
+                    #   updated_ts が最後の完走サイクル時刻で固まり「稼働中に見える停止」になる。
+                    #   429 が続くと長時間化する経路(実測6.5時間)なので、外から見えることが必須。
+                    self._write_status()
                     time.sleep(self.cfg.get("cooldown_seconds", 10))
                     continue
             skipped = False

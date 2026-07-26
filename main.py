@@ -6,10 +6,12 @@ txflowでBTCをmaker farm(将来pt)しつつ、perplで逆BTCをヘッジ=デル
 
 ## 構成
 - txflow脚(farm): TxflowClient(txflow-bot/src、eth_account署名)。BTC=coin1、maker。
-- perpl脚(hedge): PerplExecutor/PerplMarketData(hlbot-sandbox/src、Ed25519署名)。BTC=market1。
+- perpl脚(hedge): PerplExecutor/PerplMarketData(apps/hyperliquid-bot/src、Ed25519署名)。BTC=market1。
   maker(0.9bps)で置き、leg_timeout内に刺さらなければtakerフォールバック(6.9bps)で裸窓を閉じる。
 - 保守版クライアントを import 再利用(コピーしない=分岐を作らない)。venvは依存が揃った
-  hlbot-sandbox/.venv を使う(ecosystem.config.js の interpreter)。
+  apps/hyperliquid-bot/.venv を使う(ecosystem.config.js の interpreter)。
+  ★perpl層の参照先は 2026-07-26 に hlbot-sandbox から apps/hyperliquid-bot へ移した
+    (フォーク統合。下の sys.path.insert のコメント参照)。
 
 ## 安全
 - dry_run(既定): 発注せず両会場の板から約定を模擬。1サイクル完走を確認してから実弾化。
@@ -37,7 +39,7 @@ APP = Path(__file__).resolve().parent
 
 def _load_as_package(pkg_name: str, pkg_dir: Path, submodules: list[str]) -> dict:
     """pkg_dir 内の .py を pkg_name パッケージ配下として import(ライブコード再利用・コピーしない)。
-    txflow-bot と hlbot-sandbox が両方 `src` パッケージ名を使い衝突するため、txflow側を別名で読む。
+    txflow-bot と hyperliquid-bot が両方 `src` パッケージ名を使い衝突するため、txflow側を別名で読む。
     submodules は依存順(先に読んだものが後続の相対importで解決される)。"""
     pkg = types.ModuleType(pkg_name)
     pkg.__path__ = [str(pkg_dir)]
@@ -58,8 +60,14 @@ _tx = _load_as_package("txflowpkg", Path.home() / "apps" / "txflow-bot" / "src",
                        ["txflow_signing", "txflow_client"])
 TxflowClient = _tx["txflow_client"].TxflowClient
 
-# --- perpl: hlbot-sandbox の `src` パッケージをそのまま使う(perpl_exchange は from src import 依存) ---
-sys.path.insert(0, str(Path.home() / "hlbot-sandbox"))
+# --- perpl: apps/hyperliquid-bot の `src` パッケージをそのまま使う(perpl_exchange は from src import 依存) ---
+# ★2026-07-26 に hlbot-sandbox から移行した。理由: perpl層が2系統にフォークしており、
+#   hlbot-sandbox 側(mtime 07-13)には **fills ページング打ち切り判定のバグが残っていた**
+#   (429=CF 1015 の量的主因。5,000-6,700ページ取得/時)。修正は apps/hyperliquid-bot 側に
+#   しか入っておらず、xvenue はバグ持ちの古いスナップショットを使い続けていた。
+#   API面は apps/hyperliquid-bot 側が厳密な上位集合(774行→1521行)で、署名も
+#   PerplMarketData に binance_symbol(デフォルト付き)が増えるだけ=呼び出し側は無変更。
+sys.path.insert(0, str(Path.home() / "apps" / "hyperliquid-bot"))
 from src import perpl_client as _pc            # noqa: E402
 from src import perpl_exchange as _pe          # noqa: E402
 PerplClient = _pc.PerplClient

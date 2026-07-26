@@ -70,6 +70,7 @@ TxflowClient = _tx["txflow_client"].TxflowClient
 sys.path.insert(0, str(Path.home() / "apps" / "hyperliquid-bot"))
 from src import perpl_client as _pc            # noqa: E402
 from src import perpl_exchange as _pe          # noqa: E402
+from src import perpl_account_guard as _pag    # noqa: E402  口座レベルの合算ガード(両セル共有)
 PerplClient = _pc.PerplClient
 PerplMarketData = _pe.PerplMarketData
 PerplExecutor = _pe.PerplExecutor
@@ -806,8 +807,32 @@ class XVenueHedge:
             pass
 
     def _halt_reason(self) -> Optional[str]:
-        """撤退基準。主役は**効率(出来高$÷損失$)**で、loss_budget はバグ暴走用の外側の弁
-        (2026-07-25 改定。config.yaml の efficiency_floor コメント参照)。"""
+        """撤退基準(2026-07-26 改定)。
+
+        ## 主役は perpl 口座の**合算ローリングガード**
+        本セルは txflow の出来高farm が目的なので、**効率(出来高÷損失)は撤退基準にしない**
+        (ユーザー方針 2026-07-26)。代わりに口座を守るのは合算ガード:
+        pair_hedge と同一 perpl 口座を共有しているのにセル別予算しか無く、
+        $200 x 2 = equity($186)の約2倍 = 実質ノーガードだった(監査 M-7)。
+
+        ## なぜ効率を外せるのか / 外して何が残るのか
+        効率の分岐点計算には次元の誤りがあった: volume_usd は `notional * 4`
+        = **2会場x(open+close)のブレンド**なのに、pt率 10pt/$100k は **perpl 単独**の実測値。
+        ブレンド出来高に perpl の率を掛けており収入が正確に2倍過大で、
+        真の分岐点は 4,902 ではなく 9,804(k補正後 8,668)だった。
+        現行効率 5,843 はそこを大きく割る = 効率で判定すると即停止になる。
+        出来高farmを続ける方針なので効率ゲートは無効化し(config efficiency_floor: 0)、
+        口座の生存だけを合算ガードで守る。
+
+        ## 残る3段
+        1. 合算ローリングガード(account_guard_24h_usd) … 口座を守る主役
+        2. loss_budget_usd(セル累積) … バグ暴走用の外側の弁
+        3. efficiency_floor … 既定0=無効。効率で止めたくなったら戻す口を残す
+        """
+        # 1. 口座レベル: 両セルの直近24h合算損失。全期間累積は既に -$144 で閾値を置けないため窓で見る。
+        guard = _pag.halt_reason(float(self.cfg.get("account_guard_24h_usd", 0) or 0))
+        if guard:
+            return guard
         if self.cum_net <= -float(self.cfg["loss_budget_usd"]):
             return (f"loss_budget${self.cfg['loss_budget_usd']}超過"
                     f"(net=${self.cum_net:.3f})")

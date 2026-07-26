@@ -8,7 +8,22 @@ enabled: true
 
 symbol: "BTC"          # 対象資産(両会場共通)。案④(薄銘柄でtxflow maker化)は確定ネガ2026-07-24=HYPE/ZECともperpl側ワイドspreadの価格損(-15bps)がtxflow maker節約(-3bps)に必ず負ける(会場間流動性の反転)→BTC復帰。BTCはperpl spread0.03bpsでレース無し・basis≈0で価格ヘッジほぼ完全。perpl BTC=market1、txflow BTC=coin1
 notional_usd: 150      # ①スケール2026-07-24: 100→150(perpl free$153実測・$150/3x=$50 free内)。xvenue perpl脚(効率9,636)の出来高を+50%=perpl会場ブレンドの9,636成分を成長。txflow$107/3x=$50内。★pair_hedgeと共有perpl口座=同時保有ピークを要監視
-hold_seconds: 90       # 8500狙い②(hold60)は棄却(2026-07-24): priceはbasisノイズで窓依存(-$0.35〜-$0.69)・制御不能→既知ベスト90へ復帰
+hold_seconds: 300      # ★2026-07-27 Step1: 90→300。**OI と保有時間を積むための延長**(方針転換)。
+                       # 昨今のエアドロは出来高だけでなく PnL と OI も見るという判断で、評価軸が
+                       # 「出来高あたりの効率」から「建玉を持っている時間の総和」に変わった。
+                       # 実測の根拠:
+                       #   ・TWA OI = notional × hold/gap、gap = 103.3 + 1.067×hold(実測フィット)
+                       #     → hold 90 で OI $67.7 → hold 300 で $106.3 → hold 600 で $121.0
+                       #   ・**平均価格損は hold に依存しない**(hold45 -1.133bps vs hold90 -1.265bps、
+                       #     t=+0.21)。損失は約定時点の固定コスト(逆選択)で保有中の蓄積ではない
+                       #     → 効率(出来高÷損失)は hold 不変。出来高もコストも同率で減るだけ。
+                       #   ・perpl BTC の funding.rate = 0(funding_interval 3600s)なので
+                       #     長時間保有のキャリーコストはゼロ。
+                       #   ・出来高が減る分 **損失も比例して減る** = runway が伸びる(入金しない方針)。
+                       # ★出来高/OI 比は mPoints の唯一の定量的 inorganic 定義 min(ADV, OI×10) に対し
+                       #   実測 1,920x(perpl 全体は 8.1x)。hold 延長はこの比を直接改善する。
+                       # 旧: 90。8500狙い②(hold60)は棄却(2026-07-24)だが、あれは**効率**を目標に
+                       # した判定で、OI を目的にする現方針とは評価軸が違う。次は 600 を予定(Step2)。
 cooldown_seconds: 30    # サイクル間クールダウン。429対策済みで30→15へ短縮(throughput↑)
 skip_cooldown_seconds: 5   # 2026-07-25追加: **見送り時**のクールダウン(建玉を取っていないので
                            # 冷やす対象が無い)。実測(07-25 12時以降): lead不成立率36.7%・見送り1回
@@ -62,10 +77,29 @@ rl_backoff_cap_seconds: 240
 #   直近24h の合算損失 -$43.59 = 残存の 23.4%/日 → 現金ベースで枯渇まで約4.3日。
 #   perpl pt 収入($33.07/日)を全額数えても -$10.52/日。
 #   かつ risk.dex_overrides.perpl.max_drawdown_pct が null なので**口座DDハルトが存在しない**。
-account_guard_24h_usd: 60   # ★主役。両セル(pair_hedge + xvenue)の**直近24h合算**損失がこれを
-                            # 超えたら停止。全期間累積(-$144.89)では閾値を置けないので窓で見る。
-                            # 実測 -$43.59 に対し約1.4倍のヘッドルーム=通常運転では発火しない。
+account_guard_24h_usd: 40   # ★主役。両セルの**直近24h合算**損失がこれを超えたら停止。
                             # 実装は apps/hyperliquid-bot/src/perpl_account_guard.py(両セル共有)。
+                            # ★2026-07-27: 60→40。ガード自体を「**perpl 脚だけ**を合算する」よう
+                            #   修正した(C-3)ので、同じ実損でも数字が小さく出るようになった:
+                            #   修正前 両会場ブレンド -$45.7 → 修正後 perpl脚のみ -$23.03
+                            #   (pair_hedge -$15.12 + xvenue perpl脚 -$7.91)。
+                            #   xvenue の txflow 側の損失は **txflow 口座**から出るので perpl の
+                            #   equity を1セントも減らさない。それを perpl 口座のガードに混ぜて
+                            #   いたのが誤りだった(txflow の損失で perpl 側が止まる/逆に perpl が
+                            #   本当に減っていても検出が遅れる、の二重の誤り)。
+                            #   閾値は perpl equity $163.84 − 床 $140 = 余裕 $23.84 を基準に、
+                            #   hold 延長で burn が半減する見込みを織り込んで 40。
+perpl_equity_floor_usd: 140 # ★2026-07-27新設。perpl 口座の equity がこれを割ったら停止。
+                            # 床の根拠 = 同時に持つ全セルの必要証拠金:
+                            #   xvenue BTC $150/3x=$50 + pair_hedge SOL $120/3x=$40
+                            #   + pair_hedge ETH $145.2/3x=$48.4 ≒ $138.4
+                            # ここを割ると発注自体が通らなくなる(=farm が機能停止する)ので、
+                            # その手前で明示的に止める。
+                            # ★risk.dex_overrides.perpl.max_drawdown_pct(ピーク比)を使わないのは
+                            #   **意図的**。perpl は出来高を買うために意図的に損を出すセルで equity は
+                            #   設計上単調に下がるため、ピーク比の全凍結は「設計どおり動いているだけ」で
+                            #   発火する(2026-07-17 に偽DD 19.6% で全凍結の$1.03手前まで行った実例。
+                            #   src/risk.py の _dd_limit docstring)。絶対額の床ならその矛盾がない。
 efficiency_floor: 0      # ★0=無効(2026-07-26)。上記の通り効率は本セルの撤退基準にしない。
                          # 効率で止めたくなったら真の分岐点 8,668〜9,804 を入れる
                          # (旧値 4,900 は次元の誤りで半分。戻すなら再導出すること)。

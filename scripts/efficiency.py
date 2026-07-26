@@ -51,11 +51,15 @@ def _read(path: Path, keep=lambda r: True) -> list[dict]:
 
 
 def _acc(rows, vol_key="volume_usd", net_key="net_usd") -> dict:
-    """出来高・netを合算。net_keyは戦略で違う(xvenue/pair_hedge=net_usd, txflow-bot=net_pnl_usd)。"""
+    """出来高・netを合算。net_keyは戦略で違う(xvenue/pair_hedge=net_usd, txflow-bot=net_pnl_usd)。
+
+    ★`skip_reason` を持つ行は**中断サイクルのコスト計上**(2026-07-27 D-5)。出来高0・
+    net=-手数料 なので損失には数えるが、**サイクル数には数えない**(完走ではないため)。"""
     vol = sum(r.get(vol_key, 0) for r in rows)
     net = sum(r.get(net_key, 0) for r in rows)
     fees = sum(r.get("fees_usd", r.get("fee_usd", 0)) for r in rows)
-    return {"n": len(rows), "volume": vol, "net": net, "fees": fees}
+    n = sum(1 for r in rows if not r.get("skip_reason"))
+    return {"n": n, "volume": vol, "net": net, "fees": fees}
 
 
 def _xvenue_by_venue(rows) -> dict:
@@ -71,6 +75,8 @@ def _xvenue_by_venue(rows) -> dict:
     perpl = {"volume": 0.0, "net": 0.0, "n": 0}
     txflow = {"volume": 0.0, "net": 0.0, "n": 0}
     for r in rows:
+        if r.get("skip_reason"):   # 中断コスト行(D-5)は脚別に分解できない(出来高0)→会場別から除外。
+            continue               # 戦略別(_acc)には含まれるので、会場別の合計とは差が出る。
         n = r.get("notional_usd", 0)
         pp = r.get("perpl", {}) or {}
         tx = r.get("txflow", {}) or {}
@@ -89,6 +95,8 @@ def _xvenue_by_symbol(rows) -> dict:
     """xvenueは1サイクル1銘柄。symbol でそのまま分ける(2026-07-25以前の行はBTC後付け済み)。"""
     out = {}
     for r in rows:
+        if r.get("skip_reason"):   # 中断コスト行(D-5)は完走ではない→銘柄別からは除外
+            continue
         a = out.setdefault(r.get("symbol", "BTC"), {"n": 0, "volume": 0.0, "net": 0.0, "fees": 0.0})
         a["n"] += 1
         a["volume"] += r.get("volume_usd", 0.0)

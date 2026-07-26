@@ -78,7 +78,18 @@ PerplExecutor = _pe.PerplExecutor
 CYCLES_PATH = APP / "data" / "cycles.jsonl"
 STATUS_PATH = APP / "data" / "status.json"
 
-PERPL_MCFG = {"market_id": 1, "price_decimals": 1, "size_decimals": 5, "leverage": 3}  # BTC(2026-07-24 案④確定ネガ=HYPE/ZECはperplワイドspreadの価格損がtxflow maker節約に必ず負ける→BTC復帰)。HYPE=id40/pd4/sd2・ZEC=id50/pd2/sd4
+# perpl の market 定義。**config の symbol から引く**(2026-07-27)。
+# ★旧コードは market_id=1(BTC)のハードコードで、config.yaml の symbol を変えても追随せず
+#   「txflow=新銘柄 / perpl=BTC」という致命的ミスマッチを生む地雷だった(監査 B-4)。
+#   2026-07-24 に HYPE→BTC を戻したときは手で書き換えていて、忘れれば別銘柄をヘッジする。
+# 案④確定ネガ(2026-07-24): HYPE/ZEC は perpl 側ワイド spread の価格損が txflow maker 節約に
+#   必ず負ける(会場間流動性の反転)→BTC が最適。定義は残すが通常は BTC を使う。
+_PERPL_MARKETS = {
+    "BTC":  {"market_id": 1,  "price_decimals": 1, "size_decimals": 5, "leverage": 3},
+    "HYPE": {"market_id": 40, "price_decimals": 4, "size_decimals": 2, "leverage": 3},
+    "ZEC":  {"market_id": 50, "price_decimals": 2, "size_decimals": 4, "leverage": 3},
+}
+PERPL_MCFG = dict(_PERPL_MARKETS["BTC"])   # __init__ で config の symbol に合わせて差し替える
 
 
 def log(msg: str) -> None:
@@ -92,6 +103,13 @@ class XVenueHedge:
         self.notional = float(cfg["notional_usd"])
         self.fees = cfg["fees"]
         self.symbol = cfg.get("symbol", "HYPE")  # txflow place/cancel/l2book は symbol名を取る(内部でcoin_index)
+        # ★perpl market を symbol から差し替える(2026-07-27 B-4)。ここが無いと config の symbol を
+        #   変えても perpl 側は BTC のままで、txflow=新銘柄 / perpl=BTC のミスマッチになる。
+        _m = _PERPL_MARKETS.get(self.symbol.upper())
+        if _m is None:
+            raise SystemExit(f"perpl market 未定義: {self.symbol}（_PERPL_MARKETS に追加すること）")
+        PERPL_MCFG.clear()
+        PERPL_MCFG.update(_m)
 
         # --- txflow(BTC価格・発注) ---
         load_dotenv(Path.home() / "apps" / "txflow-bot" / ".env")
@@ -147,7 +165,8 @@ class XVenueHedge:
             self.cum_volume += d.get("volume_usd", 0.0)
             self.cum_net += d.get("net_usd", 0.0)
             self.cum_fees += d.get("fees_usd", 0.0)
-            self.cycles += 1
+            if not d.get("skip_reason"):        # 中断行(D-5)は完走サイクルではない
+                self.cycles += 1
 
     # ---- 板取得 ----
     def _txflow_bbo(self):
@@ -756,7 +775,13 @@ class XVenueHedge:
                         self._tx_unwind(tx_is_buy, abs(pos))   # txflow の部分建玉も残さない
                     self._perpl_unwind(perpl_is_buy, size)
                     self.dirty = True                    # 裸残の疑い→次ループでflatten確認
-                    return {"skip": "hedge_failed_unwound"}
+                    # ★中断コストを台帳に持ち帰る(2026-07-27 D-5)。perpl unwind は reduce-only
+                    #   taker、txflow の畳みも taker。旧コードは skip をそのまま返しており、
+                    #   これらが cum_net に入らなかった=account_guard も同じだけ過小評価していた。
+                    ab_fee = self.notional * self.fees["perpl_taker_bps"] / 1e4
+                    if abs(pos) > 1e-8:
+                        ab_fee += self.notional * (abs(pos) / size) * self.fees["txflow_taker_bps"] / 1e4
+                    return {"skip": "hedge_failed_unwound", "abort_fees_usd": ab_fee}
                 # maker約定分(pos0)と taker約定分(残量)の混成なので手数料も按分する。
                 mk = self.notional * (pos0 / size) * self.fees["txflow_maker_bps"] / 1e4
                 tk = self.notional * (min(remaining, abs(pos)) / size) * self.fees["txflow_taker_bps"] / 1e4
@@ -904,6 +929,12 @@ class XVenueHedge:
         pp_fee = self.notional * (self.fees["perpl_maker_bps"] + self.fees["perpl_close_bps"]) / 1e4  # lead=常にmaker
         fees = tx_fee + pp_fee
         net = tx_pnl + pp_pnl - fees
+        # ★出来高は**実約定**から積む(2026-07-27 D-4)。旧コードは `notional * 4` の名目固定で、
+        #   部分約定と価格変動を無視して +1.40% 過大に出ていた(実測: 記録$333,935 vs 実額$329,338)。
+        #   効率(出来高÷損失)の分子なので、甘い方向に 1.4% ずれ続けていた。
+        tx_osz = float(tx_fill.get("sz") or size)
+        tx_csz = float(tx_cfill.get("sz") or tx_osz)
+        volume = (tx_o * tx_osz + tx_c * tx_csz) + (pp_open_px + pp_close_px) * size
         return {
             "ts": round(time.time(), 3), "symbol": self.symbol, "dir_buy": dir_buy, "dry_run": False,
             "size": size, "notional_usd": self.notional,
@@ -917,7 +948,7 @@ class XVenueHedge:
                       "pnl": round(pp_pnl, 5), "taker_hedge": False,
                       "size": size, "notional": round(pp_open_px * size, 4),
                       "close_recovered": pp_close_ok},
-            "fees_usd": round(fees, 6), "volume_usd": round(self.notional * 4, 4), "net_usd": round(net, 6),
+            "fees_usd": round(fees, 6), "volume_usd": round(volume, 4), "net_usd": round(net, 6),
         }
 
     def _write_status(self) -> Optional[float]:
@@ -947,6 +978,36 @@ class XVenueHedge:
             "txflow_equity_usd": (None if self.dry_run else self._tx_equity()),
         }, indent=2))
         return eff
+
+    def _record_abort(self, reason: str, fees: float) -> None:
+        """中断サイクルのコストを台帳に残す(2026-07-27 D-5)。出来高0・net=-手数料。
+
+        旧コードは見送り/中断を台帳に一切書かず、unwind の taker 手数料が cum_net に入って
+        いなかった(実測 10時間窓で $0.151 = 損失の1.3%)。account_guard_24h_usd も同じ台帳を
+        読むので、**ガードが同じだけ過小評価**していた。
+        ★`skip_reason` を持つ行は完走サイクルではない。集計側は cycles に数えないこと
+        (_load_ledger と scripts/efficiency.py で除外済み)。"""
+        rec = {"ts": round(time.time(), 3), "symbol": self.symbol, "dry_run": self.dry_run,
+               "skip_reason": reason, "volume_usd": 0.0,
+               "fees_usd": round(fees, 6), "net_usd": round(-fees, 6)}
+        with CYCLES_PATH.open("a") as f:
+            f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        self.cum_net += rec["net_usd"]
+        self.cum_fees += rec["fees_usd"]
+        self._write_status()
+        log(f"中断コスト計上: {reason} fees=${fees:.4f} cum_net=${self.cum_net:+.3f}")
+
+    def _notify_halt_cleared(self) -> None:
+        """自己ハルト**解除**を Discord へ1回だけ通知(状態遷移時のみ)。fail-open。"""
+        try:
+            subprocess.run(["discord-notify", "-t", "xvenue-hedge ハルト解除", "-c", "green",
+                            f"ハルト条件が消えたので稼働を再開した。\n"
+                            f"直前の理由: {self.halted_reason}\n"
+                            f"cycles={self.cycles} 出来高=${self.cum_volume:,.0f} "
+                            f"net=${self.cum_net:+.3f}"],
+                           timeout=15, check=False)
+        except Exception:
+            pass
 
     def _notify_halt(self, reason: str) -> None:
         """自己ハルトを Discord へ1回だけ通知(状態遷移時のみ)。fail-open — 通知の失敗で
@@ -984,7 +1045,8 @@ class XVenueHedge:
         3. efficiency_floor … 既定0=無効。効率で止めたくなったら戻す口を残す
         """
         # 1. 口座レベル: 両セルの直近24h合算損失。全期間累積は既に -$144 で閾値を置けないため窓で見る。
-        guard = _pag.halt_reason(float(self.cfg.get("account_guard_24h_usd", 0) or 0))
+        guard = _pag.halt_reason(float(self.cfg.get("account_guard_24h_usd", 0) or 0),
+                                 equity_floor_usd=float(self.cfg.get("perpl_equity_floor_usd", 0) or 0))
         if guard:
             return guard
         # 1b. txflow 口座の証拠金(2026-07-27追加)。account_guard は両セルの**セルnet**を合算する
@@ -1037,6 +1099,17 @@ class XVenueHedge:
                     self._notify_halt(reason)
                 time.sleep(30)
                 continue
+            if self.halted:
+                # ★ハルト条件が消えた=自動再開。旧コードは halted を False に戻す箇所が
+                #   __init__ にしか無く、account_guard(ローリング24h窓)が戻って実際に稼働を
+                #   再開しても status.json は永久に halted:true のままだった(2026-07-27 C-2)。
+                #   「止まっているように見えて動いている」は「動いて見えて止まっている」と
+                #   同じくらい危険なので、解除も状態遷移として通知する。
+                log(f"自己ハルト解除(条件消失): 直前の理由={self.halted_reason}")
+                self._notify_halt_cleared()
+                self.halted = False
+                self.halted_reason = ""
+                self._write_status()
             # cycle例外後は新規サイクルより先に両会場をフラット化(裸脚の上に建てない)
             if self.dirty and not self.dry_run:
                 if self.dirty_since is None:
@@ -1061,6 +1134,9 @@ class XVenueHedge:
                 if rec.get("skip"):
                     skipped = True
                     log(f"cycle見送り: {rec['skip']}")
+                    # 中断コスト(unwind の taker 手数料等)があれば台帳に残す(2026-07-27 D-5)
+                    if rec.get("abort_fees_usd"):
+                        self._record_abort(rec["skip"], float(rec["abort_fees_usd"]))
                     # ★見送り時にperplへ想定外建玉(cancel-fillレースの残脚。2026-07-24 HYPEで多発)が
                     #   あればガードがskipし続けて停止+脚放置になる。常駐AccountFeed(WS・429負荷ほぼ無)で
                     #   検出したらdirtyを立て次ループで両会場flat化=停止と裸脚を自己修復する。

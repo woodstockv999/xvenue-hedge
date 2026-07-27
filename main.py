@@ -86,10 +86,40 @@ STATUS_PATH = APP / "data" / "status.json"
 #   必ず負ける(会場間流動性の反転)→BTC が最適。定義は残すが通常は BTC を使う。
 _PERPL_MARKETS = {
     "BTC":  {"market_id": 1,  "price_decimals": 1, "size_decimals": 5, "leverage": 3},
+    "ETH":  {"market_id": 20, "price_decimals": 2, "size_decimals": 3, "leverage": 3},
     "HYPE": {"market_id": 40, "price_decimals": 4, "size_decimals": 2, "leverage": 3},
     "ZEC":  {"market_id": 50, "price_decimals": 2, "size_decimals": 4, "leverage": 3},
 }
-PERPL_MCFG = dict(_PERPL_MARKETS["BTC"])   # __init__ で config の symbol に合わせて差し替える
+
+class _PerplLeg:
+    """perpl の1市場ぶんの実行面(market_id/精度/板/executor/BBOキャッシュ)を1個にまとめる。
+
+    ★このクラスの唯一の存在理由は「**グローバルを持たないこと**」(2026-07-27)。
+      旧実装は `PERPL_MCFG` というモジュールグローバルの単一 dict を __init__ で書き換える
+      方式で、2市場を同時に扱った瞬間に「最後に書き換えた側の market_id/精度」が両脚に効く。
+      2026-07-24 の「銘柄ハードコードで裸建玉を量産」と**同型の罠**なので、差し替え式ではなく
+      脚ごとに持つ形にする。BBOキャッシュを脚別にするのも同じ理由 — 単一のままだと
+      ETH の発注に BTC の BBO が乗る。
+
+    ★PerplAccountFeed はここに持たない。全market横断のストリームで getter が market_id
+      フィルタ済みなので、client 単位で1本を共有する(WS上限 ~5/IP)。"""
+
+    def __init__(self, symbol: str, mcfg: dict, client, bbo_ttl: float):
+        self.symbol = symbol.upper()
+        self.name = f"perpl:{self.symbol}"
+        self.mcfg = dict(mcfg)
+        self.market_id = int(self.mcfg["market_id"])
+        self.price_decimals = int(self.mcfg["price_decimals"])
+        self.size_decimals = int(self.mcfg["size_decimals"])
+        self.market = PerplMarketData(self.name, client, self.mcfg)
+        self.exec = PerplExecutor(self.market, client)
+        self.book = _pc.PerplBookFeed(client.ws_url, self.market_id, self.price_decimals)
+        self.book.start()
+        self.bbo_ttl = bbo_ttl
+        self.bbo_cache = None      # (monotonic時刻, (bid, ask))。**脚別**であることが重要
+
+    def __repr__(self) -> str:
+        return f"<_PerplLeg {self.name} mid={self.market_id}>"
 
 
 def log(msg: str) -> None:
@@ -108,8 +138,6 @@ class XVenueHedge:
         _m = _PERPL_MARKETS.get(self.symbol.upper())
         if _m is None:
             raise SystemExit(f"perpl market 未定義: {self.symbol}（_PERPL_MARKETS に追加すること）")
-        PERPL_MCFG.clear()
-        PERPL_MCFG.update(_m)
 
         # --- txflow(BTC価格・発注) ---
         load_dotenv(Path.home() / "apps" / "txflow-bot" / ".env")
@@ -119,21 +147,36 @@ class XVenueHedge:
         self.coin = self.tx.coin_index(self.symbol)  # info l2Book 用の coin_index(HYPE=44)
         _tx_sd = self.tx._symbol_meta[self.symbol.upper()]["size_decimals"]
         # 両会場のsize_decimalsは異なる(HYPE: txflow=1/perpl=2)。粗い方に丸めれば両脚同量=裸デルタ回避。
-        self._size_round = min(_tx_sd, int(PERPL_MCFG["size_decimals"]))
+        self._size_round = min(_tx_sd, int(_m["size_decimals"]))
 
-        # --- perpl(BTC価格・ヘッジ発注) ---
+        # --- perpl(**脚ごとに1組**。グローバルは持たない。_PerplLeg の docstring 参照) ---
         load_dotenv(Path.home() / "apps" / "hyperliquid-bot" / ".env")
         self.pp_client = PerplClient(os.environ["PERPL_API_KEY"], os.environ["PERPL_API_KEY_SECRET"])
-        self.pp_market = PerplMarketData(f"perpl:{self.symbol}", self.pp_client, PERPL_MCFG)
-        self.pp_exec = PerplExecutor(self.pp_market, self.pp_client)
+        _bbo_ttl = float(cfg.get("perpl_bbo_ttl_seconds", 2.0))
         # A(2026-07-24): BBOを常駐板WS(公開market-data)から取り、REST get_context(CF 1015誘発)を減らす。
         # 取れない/古いときは None→従来のREST短TTLキャッシュにフォールバック(WSは最適化・正ではない)。
-        self.pp_book = _pc.PerplBookFeed(self.pp_client.ws_url, PERPL_MCFG["market_id"],
-                                         PERPL_MCFG["price_decimals"])
-        self.pp_book.start()
+        self.lead_leg = _PerplLeg(self.symbol, _m, self.pp_client, _bbo_ttl)
+        self.legs = {self.lead_leg.symbol: self.lead_leg}
+        # ヘッジ脚(perpl ETH)。**既定は構築しない** — WS/接続を焼かないため。
+        # lead を txflow より大きく建てた残差を、この脚で相殺する(3脚化=C5)。
+        self.hedge_leg: Optional[_PerplLeg] = None
+        if cfg.get("hedge_leg_enabled", False):
+            _hsym = str(cfg.get("hedge_symbol", "ETH")).upper()
+            _hm = _PERPL_MARKETS.get(_hsym)
+            if _hm is None:
+                raise SystemExit(f"perpl hedge market 未定義: {_hsym}（_PERPL_MARKETS に追加）")
+            if _hsym == self.lead_leg.symbol:
+                raise SystemExit(f"hedge_symbol が lead と同一: {_hsym}（別market にすること）")
+            self.hedge_leg = _PerplLeg(_hsym, _hm, self.pp_client, _bbo_ttl)
+            self.legs[_hsym] = self.hedge_leg
+            self._sr_hedge = self.hedge_leg.size_decimals
         # A2(2026-07-24): 建玉読みを常駐認証WS(PerplAccountFeed)から取り、CF 1015の主因である
         # 「1操作1接続」の認証WSハンドシェイクを減らす。取れない/古いときは None→従来のREST/WS短命経路。
-        self.pp_account = _pc.PerplAccountFeed(self.pp_client)
+        # ★2026-07-27: 直接生成していたため **認証WSが2本張られていた**。PerplExecutor が
+        #   内部で client.shared_account_feed() を呼んで別インスタンスを作るため。
+        #   perpl の WS 上限は ~5/IP なので1本ぶんの無駄が 429 を近づけていた。
+        #   account ストリームは全market横断で getter が market_id フィルタ済み＝共有して正しい。
+        self.pp_account = self.pp_client.shared_account_feed()
         self.pp_account.start()
 
         # --- 台帳(累積) ---
@@ -147,8 +190,6 @@ class XVenueHedge:
         # dirty に入った時刻(status.json 経由で外側に継続時間を見せる用)。dirty=True の代入は
         # 7箇所に散っているので、そこは触らず **loop() 側で一元管理**する。
         self.dirty_since: Optional[float] = None
-        self._pp_bbo_cache = None                       # (monotonic時刻, (bid,ask)) 429緩和のBBO短TTL
-        self._pp_bbo_ttl = float(cfg.get("perpl_bbo_ttl_seconds", 2.0))
         self._rl_backoff = 0.0                          # perpl 429時のエスカレート待機(clean cycleで0へ)
         self._skip_streak = 0                           # 連続見送り数。詰まったまま叩き続ける自己増幅429を止める
         self._tx_eq_cache = (0.0, None)                 # (monotonic, txflow accountValue) 60s TTL
@@ -174,46 +215,43 @@ class XVenueHedge:
         bids, asks = b["levels"][0], b["levels"][1]
         return float(bids[0]["px"]), float(asks[0]["px"])
 
-    def _pp_szi(self) -> float:
-        """perpl BTC 符号付き建玉。常駐口座WS(handshake不要)を優先、取れなければ従来の
+    def _pp_szi(self, leg: "_PerplLeg") -> float:
+        """perpl の符号付き建玉(脚指定)。常駐口座WS(handshake不要)を優先、取れなければ従来の
         get_position_szi(1操作1接続)へフォールバック。両者とも失敗は0.0扱い(get_position_sziと同契約)。
         ★fail-open(429で0.0)なので『建玉ゼロ確認してから発注』の判断には使わない(それは_fetch_position)。"""
-        p = self.pp_account.get_position(PERPL_MCFG["market_id"], PERPL_MCFG["price_decimals"],
-                                         PERPL_MCFG["size_decimals"])
+        p = self.pp_account.get_position(leg.market_id, leg.price_decimals, leg.size_decimals)
         if p is not None:
             return p.get("szi", 0.0)
-        return self.pp_exec.get_position_szi()
+        return leg.exec.get_position_szi()
 
-    def _pp_szi_strict(self) -> Optional[float]:
+    def _pp_szi_strict(self, leg: "_PerplLeg") -> Optional[float]:
         """符号付き建玉。**読めなければ None**(fail-open しない)。0.0 は『確認できたフラット』。
 
         _pp_szi は 429 等で 0.0 を返す契約なので「建玉が無い」の判断には使えない。close 判定に
         使うと、建玉が残っているのに close を飛ばし、さらに約定価格として BBO 中値(架空値)を
         台帳に書く二重障害になる(2026-07-27 N-2)。"""
-        p = self.pp_account.get_position(PERPL_MCFG["market_id"], PERPL_MCFG["price_decimals"],
-                                         PERPL_MCFG["size_decimals"])
+        p = self.pp_account.get_position(leg.market_id, leg.price_decimals, leg.size_decimals)
         if p is not None:
             return p.get("szi", 0.0)
         try:
-            pos = self.pp_exec._fetch_position()      # fail-closed(読めなければ例外)
+            pos = leg.exec._fetch_position()          # fail-closed(読めなければ例外)
         except Exception:
             return None
         if pos is None:
             return 0.0
-        sz = _pe.scaled_to_size(int(pos["s"]), self.pp_market.size_decimals)
+        sz = _pe.scaled_to_size(int(pos["s"]), leg.market.size_decimals)
         return sz if pos.get("sd") == 1 else -sz
 
-    def _pp_feed_filled(self) -> Optional[float]:
+    def _pp_feed_filled(self, leg: "_PerplLeg") -> Optional[float]:
         """常駐口座WSから見た perpl 建玉の絶対サイズ。**handshake不要**。
         feedが切断/陳腐化/スナップショット未達なら None(=判定不能、呼び側は従来経路へ)。
 
         エントリーガードが「建玉ゼロを確認してから置く」不変条件を作っているので、resting保有中に
         建玉があればそれはこのrestingの約定量そのもの(perpl_exchange._fill_from_position と同じ論法)。"""
-        p = self.pp_account.get_position(PERPL_MCFG["market_id"], PERPL_MCFG["price_decimals"],
-                                         PERPL_MCFG["size_decimals"])
+        p = self.pp_account.get_position(leg.market_id, leg.price_decimals, leg.size_decimals)
         return None if p is None else abs(p.get("szi") or 0.0)
 
-    def _pp_entry_blocked(self) -> bool:
+    def _pp_entry_blocked(self, leg: "_PerplLeg") -> bool:
         """常駐WSだけで『エントリーを置けない』と断定できるか。**handshake不要**。
 
         ★"置ける"の判断には使わない。feedは差分配信なので置いた直後の注文が未反映な窓があり、
@@ -221,14 +259,13 @@ class XVenueHedge:
         非対称な使い方で、クリーン/判定不能なら False を返して従来どおり place_maker_resting の
         ガード(取引所の正)に最終判断を委ねる。2026-07-25 の xvenue 429 は 277件がこのガードの
         空振り(=どうせ弾かれる状況でhandshakeを焼いていた)だった。"""
-        mid = PERPL_MCFG["market_id"]
-        oids = self.pp_account.get_live_oids(mid)
+        oids = self.pp_account.get_live_oids(leg.market_id)
         if oids:
-            log(f"perpl 板に自分の指値が生存(feed) {sorted(oids)} → handshakeせず見送り")
+            log(f"{leg.name} 板に自分の指値が生存(feed) {sorted(oids)} → handshakeせず見送り")
             return True
-        szi = self._pp_feed_filled()
+        szi = self._pp_feed_filled(leg)
         if szi is not None and szi > 1e-8:
-            log(f"perpl 建玉が残っている(feed) szi={szi} → handshakeせず見送り")
+            log(f"{leg.name} 建玉が残っている(feed) szi={szi} → handshakeせず見送り")
             return True
         return False
 
@@ -240,22 +277,23 @@ class XVenueHedge:
         b = float(self.cfg.get("taker_cross_bps", 8.0)) / 1e4
         return ask * (1 + b) if is_buy else bid * (1 - b)
 
-    def _perpl_bbo(self, force_fresh: bool = False):
+    def _perpl_bbo(self, leg: "_PerplLeg", force_fresh: bool = False):
         """perpl BBO。get_best_bid_askはキャッシュ無しで毎回REST get_context(CF保護)を叩く=429主因。
         短TTLキャッシュで requote/open/close の連続読みを1回のRESTに畳む(BTC BBOは数秒で不変)。
         force_fresh=True で必ず取り直す(requoteのtouch移動判定など鮮度が要る所)。"""
         # ① 常駐板WS(REST不要・CF 1015を誘発しない)。取れれば常にライブなのでキャッシュ不要。
-        bb = self.pp_book.get_best_bid_ask()
+        bb = leg.book.get_best_bid_ask()
         if bb is not None:
             return bb
         # ② フォールバック: REST get_context(短TTLキャッシュ)。WSが未起動/古い/切断中のとき。
         now = time.monotonic()
-        if not force_fresh and self._pp_bbo_cache is not None:
-            ts, val = self._pp_bbo_cache
-            if now - ts < self._pp_bbo_ttl:
+        # ★キャッシュは**脚別**(leg.bbo_cache)。単一にすると ETH の発注に BTC の BBO が乗る。
+        if not force_fresh and leg.bbo_cache is not None:
+            ts, val = leg.bbo_cache
+            if now - ts < leg.bbo_ttl:
                 return val
-        val = self.pp_market.get_best_bid_ask()  # (bid, ask)
-        self._pp_bbo_cache = (now, val)
+        val = leg.market.get_best_bid_ask()  # (bid, ask)
+        leg.bbo_cache = (now, val)
         return val
 
     # ================= 実弾: txflow脚(farm) =================
@@ -389,7 +427,7 @@ class XVenueHedge:
             return self._run_cycle_live(dir_buy)
 
         t_bid, t_ask = self._txflow_bbo()
-        p_bid, p_ask = self._perpl_bbo()
+        p_bid, p_ask = self._perpl_bbo(self.lead_leg)
         mid = (t_bid + t_ask) / 2
         size = self.notional / mid
         # --- dry_run: open(maker touch) ---
@@ -401,7 +439,7 @@ class XVenueHedge:
 
         # --- close(hold後、再取得して maker touch で畳む) ---
         t_bid2, t_ask2 = self._txflow_bbo()
-        p_bid2, p_ask2 = self._perpl_bbo()
+        p_bid2, p_ask2 = self._perpl_bbo(self.lead_leg)
         if dir_buy:
             tx_close, pp_close = t_ask2, p_bid2      # txflow SELL@ask / perpl BUY@bid
             tx_pnl = (tx_close - tx_open) * size
@@ -426,7 +464,7 @@ class XVenueHedge:
         }
 
     # ================= 実弾サイクル =================
-    def _pp_cancel_verified(self, oid: int, tries: int = 3) -> bool:
+    def _pp_cancel_verified(self, leg: "_PerplLeg", oid: int, tries: int = 3) -> bool:
         """perpl の resting 取消を『板から消えた』まで確認する。消えたらTrue。
 
         PerplExecutor.cancel_order は失敗しても例外を投げない(内部でログして戻る)ため、
@@ -437,37 +475,41 @@ class XVenueHedge:
         2026-07-25 に 6.5時間サイクルゼロで停止した実害の対策。"""
         for _ in range(tries):
             try:
-                self.pp_exec.cancel_order(oid)
+                leg.exec.cancel_order(oid)
             except Exception:
                 pass
             try:
-                live = self.pp_exec.list_open_maker_orders()
+                live = leg.exec.list_open_maker_orders()
             except Exception:
                 live = None
             if live is not None and all(int(o) != int(oid) for _, o in live):
                 return True
             time.sleep(2)
-        log(f"⚠️ perpl resting oid={oid} を取消せない(板に残存)=次サイクルはガードでskipされる")
+        log(f"⚠️ {leg.name} resting oid={oid} を取消せない(板に残存)=次サイクルはガードでskipされる")
         return False
 
-    def _pp_partial_abort(self, oid, is_buy: bool, filled_sz: float) -> None:
+    def _pp_partial_abort(self, leg: "_PerplLeg", oid, is_buy: bool, filled_sz: float) -> None:
         """perpl lead の**部分約定は『未約定』として扱う**(残 resting を取消し約定ぶんを畳む)。
 
         PerplExecutor.place_order と同じ契約: 部分約定を『約定』として返すと、呼び側は全量
         (size)でヘッジ・損益計上するのに取引所には端数しか無い状態になる。実際 2026-07-25 の
         cycle#125 は 0.00027/0.0023(11.7%)しか約定していないのに全量約定として扱われ、
         ヘッジの88%が裸・台帳も過大計上・残 resting が孤児化して bot が停止した。"""
-        self._pp_cancel_verified(oid)
+        self._pp_cancel_verified(leg, oid)
         if filled_sz > 1e-8:
-            self._perpl_unwind(is_buy, filled_sz)
+            self._perpl_unwind(leg, is_buy, filled_sz)
         self.dirty = True  # 畳めたか確認できていない→次ループ先頭で両会場flatを確認する
 
-    def _perpl_maker_lead(self, is_buy: bool, size: float):
+    def _perpl_maker_lead(self, leg: "_PerplLeg", is_buy: bool, size: float,
+                          timeout_s: Optional[float] = None):
         """改善①②: perpl maker を先行させ requote しながら perpl_lead_timeout まで刺しにいく。
         戻り(filled, fill_px)。未約定は(False,None)。建玉=正でfill確認(false-negative対策)。
         改善④(2026-07-25): 約定検知と発注可否の先読みを**常駐口座WS**に寄せ、CF 1015の主因である
         「1操作1接続」の認証WSハンドシェイクを削る。feedが古い/切断なら従来経路へフォールバック。"""
-        plt = float(self.cfg["perpl_lead_timeout_seconds"])
+        # ★ETH ヘッジ脚もこの関数を使う(専用実装を書かない)。取消×約定レース防御・部分約定
+        #   grace・timeout時の部分建玉回収がここに全部入っており、書き直せば 2026-07-25 の
+        #   事故が確実に再発する。違いは timeout だけなので引数で受ける。
+        plt = float(self.cfg["perpl_lead_timeout_seconds"] if timeout_s is None else timeout_s)
         rq = float(self.cfg["requote_interval_seconds"])
         poll = float(self.cfg["poll_interval_seconds"])
         grace = float(self.cfg.get("partial_grace_seconds", 5.0))
@@ -476,20 +518,20 @@ class XVenueHedge:
         oid, px, last_place, partial_since = None, None, 0.0, 0.0
         while time.time() < deadline:
             if oid is None:
-                if self._pp_entry_blocked():         # 常駐WSで先に見切る(handshakeを焼かない)
+                if self._pp_entry_blocked(leg):      # 常駐WSで先に見切る(handshakeを焼かない)
                     return False, None
-                p_bid, p_ask = self._perpl_bbo()
+                p_bid, p_ask = self._perpl_bbo(leg)
                 px = p_bid if is_buy else p_ask       # maker: buyはbid/sellはaskにjoin
-                oid = self.pp_exec.place_maker_resting(is_buy, size, px, reduce_only=False)
+                oid = leg.exec.place_maker_resting(is_buy, size, px, reduce_only=False)
                 last_place, partial_since = time.time(), 0.0
                 if oid is None:
                     time.sleep(poll)
                     continue
             # 約定検知は常駐口座WS(handshake不要)を主に。取れない/古いときだけ従来の
             # poll_maker_fill(REST fills + 建玉フォールバックで1操作1接続)へ落とす。
-            fsz = self._pp_feed_filled()
+            fsz = self._pp_feed_filled(leg)
             if fsz is None:
-                f = self.pp_exec.poll_maker_fill(oid, since_ms)
+                f = leg.exec.poll_maker_fill(oid, since_ms)
                 fsz = float(f.get("sz") or 0.0) if f else 0.0
             if fsz > 1e-8:
                 if fsz >= size * 0.999:
@@ -498,47 +540,47 @@ class XVenueHedge:
                 # (REST fillsのラグが今まで結果的にこれを均していた)。grace秒待って埋まらなければ見送る。
                 if not partial_since:
                     partial_since = time.time()
-                    log(f"perpl lead 部分約定 {fsz}/{size} → {grace:.0f}s 様子見")
+                    log(f"{leg.name} lead 部分約定 {fsz}/{size} → {grace:.0f}s 様子見")
                 elif time.time() - partial_since >= grace:
-                    log(f"perpl lead 部分約定のまま {fsz}/{size} → 残restingを取消し畳んで見送り")
-                    self._pp_partial_abort(oid, is_buy, fsz)
+                    log(f"{leg.name} lead 部分約定のまま {fsz}/{size} → 残restingを取消し畳んで見送り")
+                    self._pp_partial_abort(leg, oid, is_buy, fsz)
                     return False, None
             if time.time() - last_place >= rq:       # requote: touchが動いてたら置き直す
-                szi = abs(self._pp_szi())
+                szi = abs(self._pp_szi(leg))
                 if szi >= size * 0.999:              # requote前に建玉=正で確認
                     return True, px
                 if szi > 1e-8:      # 部分約定中は置き直さない(残りが孤児化する)。
                     time.sleep(poll)  # 見送るか待つかの判断は上のgrace付き分岐に一本化する
                     continue
-                p_bid, p_ask = self._perpl_bbo()
+                p_bid, p_ask = self._perpl_bbo(leg)
                 new_px = p_bid if is_buy else p_ask
                 if new_px != px:
-                    if not self._pp_cancel_verified(oid):
+                    if not self._pp_cancel_verified(leg, oid):
                         return False, None           # 取消未確認で置き直すと建玉が2倍になる
                     oid = None
             time.sleep(poll)
         if oid:
-            self._pp_cancel_verified(oid)
+            self._pp_cancel_verified(leg, oid)
         time.sleep(1)
-        szi = abs(self._pp_szi())
+        szi = abs(self._pp_szi(leg))
         if szi >= size * 0.999:
             return True, px                          # 建玉あり=約定してた(poll false-negative)
         if szi > 1e-8:                               # timeout時の部分約定=ヘッジ相手のいない裸脚
-            log(f"perpl lead timeout時に部分建玉 {szi}/{size} → 畳んで見送り")
-            self._perpl_unwind(is_buy, szi)
+            log(f"{leg.name} lead timeout時に部分建玉 {szi}/{size} → 畳んで見送り")
+            self._perpl_unwind(leg, is_buy, szi)
             self.dirty = True
         return False, None
 
-    def _perpl_unwind(self, was_buy: bool, size: float) -> None:
+    def _perpl_unwind(self, leg: "_PerplLeg", was_buy: bool, size: float) -> None:
         """perpl脚(was_buy方向で建った)をreduce-onlyで反対に即クローズ(ヘッジ失敗時の裸回避)。
         ★get_position_sziは429でfail-open→0になり安全チェックが崩れるため使わない。
         reduce-onlyは「建玉方向にしか約定しない=flatならno-op/reject」なので、szi読めなくても
         安全に畳みにいける(fail-closed)。"""
         try:
-            self.pp_exec.place_order(not was_buy, size, "unwind", reduce_only=True)
-            log(f"unwind: perpl reduce-only close(was_buy={was_buy} size={size})")
+            leg.exec.place_order(not was_buy, size, "unwind", reduce_only=True)
+            log(f"unwind: {leg.name} reduce-only close(was_buy={was_buy} size={size})")
         except Exception as e:
-            log(f"⚠️ perpl unwind失敗={repr(e)[:50]} 手動フラット化要")
+            log(f"⚠️ {leg.name} unwind失敗={repr(e)[:50]} 手動フラット化要")
 
     def _startup_reconcile(self) -> None:
         """起動時に両会場の対象銘柄をフラット化(mid-cycle再起動での建玉残存/2倍化を防ぐ)。dry_runは無処理。"""
@@ -551,26 +593,32 @@ class XVenueHedge:
         #   になっていた。回復は「指値がいつか約定/失効する」か手動取消のみ=恒久デッドロック。
         #   txflow 側は最初から get_open_orders→cancel_order を回しており、perpl 側だけの抜け。
         #   順序が重要: 先に建玉を畳むと、残った指値が直後に約定して建玉が復活しうる。
-        try:
-            live = self.pp_exec.list_open_maker_orders()
-            if live is None:      # 取得失敗(429等)。fail-closed で「消せた」とみなさない
-                log("⚠️ startup_reconcile perpl 残存指値を読めず(429?)=取消を見送る")
-            else:
-                for _sym, oid in live:
-                    if not self._pp_cancel_verified(int(oid)):
-                        log(f"⚠️ startup_reconcile perpl oid={oid} を取消せない"
-                            f"=以降のエントリーがガードで拒否される(手動取消要)")
-        except Exception as e:
-            log(f"⚠️ startup_reconcile perpl 指値取消失敗={repr(e)[:50]}")
-        # perpl BTC: 生の建玉(fail-openしない)を読んで方向付きで畳む
-        try:
-            pos = self.pp_exec._fetch_position()
-            if pos is not None:
-                sz = _pe.scaled_to_size(int(pos["s"]), self.pp_market.size_decimals)
-                if sz > 1e-8:
-                    self._perpl_unwind(pos.get("sd") == 1, sz)  # sd==1(long)→sellで畳む
-        except Exception as e:
-            log(f"⚠️ startup_reconcile perpl建玉確認失敗={repr(e)[:50]}")
+        # ★2026-07-27: **全 perpl 脚**をループする。ヘッジ脚(ETH)を足したとき、pair_hedge 退役後の
+        #   perpl:ETH は hlbot の symbols から外れるので sweep_orphan_stops は skip、
+        #   sweep_orphan_positions は ambiguous で通知のみ = **この関数が ETH の唯一の掃除役**になる。
+        #   ここが ETH をカバーしないと 2026-07-25 の 6.5時間デッドロック(孤児 resting →
+        #   _entry_preconditions_ok が全エントリー拒否 → 再起動しても掃除されない)が ETH で再現する。
+        for leg in self.legs.values():
+            try:
+                live = leg.exec.list_open_maker_orders()
+                if live is None:  # 取得失敗(429等)。fail-closed で「消せた」とみなさない
+                    log(f"⚠️ startup_reconcile {leg.name} 残存指値を読めず(429?)=取消を見送る")
+                else:
+                    for _sym, oid in live:
+                        if not self._pp_cancel_verified(leg, int(oid)):
+                            log(f"⚠️ startup_reconcile {leg.name} oid={oid} を取消せない"
+                                f"=以降のエントリーがガードで拒否される(手動取消要)")
+            except Exception as e:
+                log(f"⚠️ startup_reconcile {leg.name} 指値取消失敗={repr(e)[:50]}")
+            # 生の建玉(fail-openしない)を読んで方向付きで畳む
+            try:
+                pos = leg.exec._fetch_position()
+                if pos is not None:
+                    sz = _pe.scaled_to_size(int(pos["s"]), leg.market.size_decimals)
+                    if sz > 1e-8:
+                        self._perpl_unwind(leg, pos.get("sd") == 1, sz)  # sd==1(long)→sellで畳む
+            except Exception as e:
+                log(f"⚠️ startup_reconcile {leg.name} 建玉確認失敗={repr(e)[:50]}")
         try:  # txflow BTC 注文取消
             for o in (self.tx.get_open_orders(self.tx.main_address) or []):
                 if str(o.get("coin", "")).split("-")[0].upper() == self.symbol:
@@ -589,10 +637,17 @@ class XVenueHedge:
             log(f"⚠️ startup_reconcile txflow失敗={repr(e)[:50]}")
 
     def _venues_flat(self) -> bool:
-        """両会場の対象銘柄がフラットか(fail-closed: 読めなければFalse=フラット未確認)。"""
+        """両会場の対象銘柄がフラットか(fail-closed: 読めなければFalse=フラット未確認)。
+        ★全 perpl 脚を見る(2026-07-27)。まず常駐WSで読み、判定不能な脚だけ REST に落とす
+        (素直に脚数ぶん _fetch_position を叩くと REST コストが脚数倍になる)。"""
         try:
-            if self.pp_exec._fetch_position() is not None:
-                return False
+            for leg in self.legs.values():
+                szi = self._pp_feed_filled(leg)      # 常駐WS(API コストゼロ)
+                if szi is None:                      # 判定不能 → fail-closed な REST へ
+                    if leg.exec._fetch_position() is not None:
+                        return False
+                elif szi > 1e-8:
+                    return False
             if abs(self._tx_position()) > 1e-8:
                 return False
             return True
@@ -617,7 +672,7 @@ class XVenueHedge:
 
         # === OPEN: perpl maker LEAD(patient+requote) ===
         perpl_is_buy = not dir_buy
-        pp_filled, pp_open_px = self._perpl_maker_lead(perpl_is_buy, size)
+        pp_filled, pp_open_px = self._perpl_maker_lead(self.lead_leg, perpl_is_buy, size)
         if not pp_filled:
             return {"skip": "perpl_lead_no_fill"}   # 建玉なし=安全に見送り
 
@@ -773,7 +828,7 @@ class XVenueHedge:
                     log(f"⚠️ txflowヘッジ不成立({abs(pos)}/{size})→両脚をunwind(裸回避)")
                     if abs(pos) > 1e-8:
                         self._tx_unwind(tx_is_buy, abs(pos))   # txflow の部分建玉も残さない
-                    self._perpl_unwind(perpl_is_buy, size)
+                    self._perpl_unwind(self.lead_leg, perpl_is_buy, size)
                     self.dirty = True                    # 裸残の疑い→次ループでflatten確認
                     # ★中断コストを台帳に持ち帰る(2026-07-27 D-5)。perpl unwind は reduce-only
                     #   taker、txflow の畳みも taker。旧コードは skip をそのまま返しており、
@@ -899,8 +954,8 @@ class XVenueHedge:
         #   うえで pp_close_px に BBO 中値(架空値)を書く二重障害になっていた(2026-07-27 N-2)。
         #   方向は open 時点で確定しているので、読めないときも reduce_only で畳みにいく
         #   (reduce_only は建玉方向にしか約定しない=flat なら no-op なので安全)。
-        pp_szi = self._pp_szi_strict()
-        p_bid, p_ask = self._perpl_bbo()
+        pp_szi = self._pp_szi_strict(self.lead_leg)
+        p_bid, p_ask = self._perpl_bbo(self.lead_leg)
         pp_close_px, pp_close_ok = None, True
         if pp_szi is None:
             log("⚠️ perpl close: 建玉を読めず → open方向から reduce_only で畳む(fail-closed)")
@@ -909,7 +964,7 @@ class XVenueHedge:
             close_sz = abs(pp_szi) if abs(pp_szi) > 1e-8 else 0.0
         if close_sz > 1e-8:
             close_is_buy = (pp_szi < 0) if pp_szi is not None else (not perpl_is_buy)
-            r = self.pp_exec.place_order(close_is_buy, close_sz, "close", reduce_only=True)
+            r = self.lead_leg.exec.place_order(close_is_buy, close_sz, "close", reduce_only=True)
             if isinstance(r, dict) and r.get("price"):
                 pp_close_px = float(r["price"])
         else:
@@ -935,19 +990,45 @@ class XVenueHedge:
         tx_osz = float(tx_fill.get("sz") or size)
         tx_csz = float(tx_cfill.get("sz") or tx_osz)
         volume = (tx_o * tx_osz + tx_c * tx_csz) + (pp_open_px + pp_close_px) * size
+        # --- v1 互換ミラー(既存の読み手が壊れないように併記する) ---
+        tx_mirror = {"open": tx_o, "close": tx_c, "pnl": round(tx_pnl, 5), "taker_follow": tx_taker,
+                     # 実約定を回収できたか。False=close価格が touch 近似(2026-07-27: 旗自体は
+                     # 作っていたのに記録dictに載せておらず、後から該当行を除外できなかった)。
+                     "close_recovered": bool(tx_cfill.get("recovered", True))}
+        # size/notional は脚別の実額。銘柄別・会場別の集計が全量約定を前提にしないためのもの
+        # (2026-07-25: 部分約定を全量計上して台帳が汚れた実害の再発防止)。
+        pp_mirror = {"open": round(pp_open_px, 1), "close": round(pp_close_px, 1),
+                     "pnl": round(pp_pnl, 5), "taker_hedge": False,
+                     "size": size, "notional": round(pp_open_px * size, 4),
+                     "close_recovered": pp_close_ok}
+        # --- v2: 脚を明示的に持つ(2026-07-27)。読み手は src/xvenue_ledger.py 経由で正規化する ---
+        # ★perpl 脚が複数になっても取りこぼさないための構造。v1 の `perpl` ミラーは lead 脚しか
+        #   表せないので、ETH ヘッジ脚を足したときに口座ガードから損益が漏れる。
+        legs = {
+            f"perpl:{self.lead_leg.symbol}": {
+                "venue": "perpl", "symbol": self.lead_leg.symbol, "role": "lead",
+                "is_buy": perpl_is_buy, "size": size,
+                "open_px": round(pp_open_px, 1), "close_px": round(pp_close_px, 1),
+                "notional": round(pp_open_px * size, 4),
+                "pnl": round(pp_pnl, 5), "fees_usd": round(pp_fee, 6),
+                "open_maker": True, "close_recovered": pp_close_ok,
+            },
+            f"txflow:{self.symbol}": {
+                "venue": "txflow", "symbol": self.symbol, "role": "follow",
+                "is_buy": tx_is_buy, "size": tx_osz,
+                "open_px": tx_o, "close_px": tx_c,
+                "notional": round(tx_o * tx_osz, 4),
+                "pnl": round(tx_pnl, 5), "fees_usd": round(tx_fee, 6),
+                "open_maker": not tx_taker,
+                "close_recovered": bool(tx_cfill.get("recovered", True)),
+            },
+        }
         return {
-            "ts": round(time.time(), 3), "symbol": self.symbol, "dir_buy": dir_buy, "dry_run": False,
+            "ts": round(time.time(), 3), "schema": 2, "mode": "2leg",
+            "symbol": self.symbol, "dir_buy": dir_buy, "dry_run": False,
             "size": size, "notional_usd": self.notional,
-            "txflow": {"open": tx_o, "close": tx_c, "pnl": round(tx_pnl, 5), "taker_follow": tx_taker,
-                       # 実約定を回収できたか。False=close価格が touch 近似(2026-07-27: 旗自体は
-                       # 作っていたのに記録dictに載せておらず、後から該当行を除外できなかった)。
-                       "close_recovered": bool(tx_cfill.get("recovered", True))},
-            # size/notional は脚別の実額。銘柄別・会場別の集計が全量約定を前提にしないためのもの
-            # (2026-07-25: 部分約定を全量計上して台帳が汚れた実害の再発防止)。
-            "perpl": {"open": round(pp_open_px, 1), "close": round(pp_close_px, 1),
-                      "pnl": round(pp_pnl, 5), "taker_hedge": False,
-                      "size": size, "notional": round(pp_open_px * size, 4),
-                      "close_recovered": pp_close_ok},
+            "legs": legs,
+            "txflow": tx_mirror, "perpl": pp_mirror,
             "fees_usd": round(fees, 6), "volume_usd": round(volume, 4), "net_usd": round(net, 6),
         }
 
@@ -1142,7 +1223,7 @@ class XVenueHedge:
                     #   検出したらdirtyを立て次ループで両会場flat化=停止と裸脚を自己修復する。
                     if not self.dry_run:
                         try:
-                            if abs(self._pp_szi()) > 1e-8:
+                            if any(abs(self._pp_szi(lg)) > 1e-8 for lg in self.legs.values()):
                                 self.dirty = True
                                 log("⚠️ 見送り時にperpl残脚検出→次ループでflatten(自己修復)")
                         except Exception:

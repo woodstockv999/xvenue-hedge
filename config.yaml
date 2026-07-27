@@ -8,6 +8,32 @@ enabled: true
 
 symbol: "BTC"          # 対象資産(両会場共通)。案④(薄銘柄でtxflow maker化)は確定ネガ2026-07-24=HYPE/ZECともperpl側ワイドspreadの価格損(-15bps)がtxflow maker節約(-3bps)に必ず負ける(会場間流動性の反転)→BTC復帰。BTCはperpl spread0.03bpsでレース無し・basis≈0で価格ヘッジほぼ完全。perpl BTC=market1、txflow BTC=coin1
 notional_usd: 150      # ①スケール2026-07-24: 100→150(perpl free$153実測・$150/3x=$50 free内)。xvenue perpl脚(効率9,636)の出来高を+50%=perpl会場ブレンドの9,636成分を成長。txflow$107/3x=$50内。★pair_hedgeと共有perpl口座=同時保有ピークを要監視
+                       # ★3脚化(C5)では **txflow 脚のサイズ**として使う。lead は lead_notional_usd。
+
+# ================= 3脚構成(2026-07-27 C5) =================
+# perpl BTC を txflow より大きく建て、差分を perpl ETH で相殺する:
+#     perpl BTC  +lead        txflow BTC -txflow_notional  → BTC net = lead - txflow
+#     perpl ETH  -(その残差)                                → ETH で中立化
+# = 旧 xvenue(BTC↔txflow BTC) と 旧 pair_hedge(BTC↔ETH) を **perpl 建玉1本**に統合した形。
+# 狙い: perpl は BTC の板が圧倒的に厚い(spread 0.015bps / ETH 0.052 / SOL 0.132)のに、
+#   BTC を使えるセルは実質1つ。pair_hedge を SOL に追いやった結果 効率 8,254→5,242 に落ちていた。
+#   統合すれば両方の役割が BTC の板の上で回る。加えて ETH 脚は**失敗してもサイクルを殺さない**
+#   ので、pair_hedge の損失源だった abort(片脚 46.9%)が設計上消える。
+hedge_leg_enabled: true    # false で ETH 脚を構築しない=**現行2脚と厳密に等価**(kill switch)
+hedge_symbol: "ETH"        # perpl のヘッジ脚。_PERPL_MARKETS に定義が要る
+# ★カナリア: lead を段階的に上げる。lead == notional_usd のとき残差0=ETH脚が構造的に不在。
+#   証拠金 = (lead + 残差) / 3x。perpl equity $152.65 に対する余裕で刻む。
+#   190 → perpl notional $230 / 証拠金 $77 / 余裕 $76   ← 今ここ
+#   224 → $298 / $99  … perpl 出来高が pair_hedge 込みの現行水準に並ぶ
+#   235 → $320 / $107 … 実用上限(runway 1.7日)
+#   280 → $411 / $137 … 目標だが床$140まで runway 0.5日で**資本が足りない**
+lead_notional_usd: 190
+hedge_ratio: 1.00          # ETH 脚の名目倍率。gross 固定の分散最小比率は 180/300/600s とも
+                           # ほぼ 1.0(実測: 0.978/0.987/1.024)。1800s まで伸ばすなら 1.10 へ再校正。
+                           # ★pair_hedge の 1.21 は逆回帰の逆数を使った方法論エラーだった。
+perpl_hedge_timeout_seconds: 120  # ETH follow の猶予。lead(45s)より長くてよい理由: 失敗しても
+                           # 全畳みで完走扱いになり、サイクルを殺さないから。実測の ETH follow
+                           # 約定率は t120 で 54.5% [46,63]。
 hold_seconds: 300      # ★2026-07-27 Step1: 90→300。**OI と保有時間を積むための延長**(方針転換)。
                        # 昨今のエアドロは出来高だけでなく PnL と OI も見るという判断で、評価軸が
                        # 「出来高あたりの効率」から「建玉を持っている時間の総和」に変わった。

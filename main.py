@@ -261,6 +261,28 @@ class XVenueHedge:
         空振り(=どうせ弾かれる状況でhandshakeを焼いていた)だった。"""
         oids = self.pp_account.get_live_oids(leg.market_id)
         if oids:
+            # ★feed の陳腐化に対する自力復帰(2026-07-27 実測の実害から追加)。
+            #   常駐WS feed が「取り消された/約定した oid」を消し損ねると、ここが永久に True を
+            #   返して全サイクルを見送る。実測: 同一 oid が **49連続** で検出され約3時間停止。
+            #   取引所に問い合わせたら **指値ゼロ・建玉フラット**で、板には何も無かった。
+            #   2026-07-25 の 6.5時間デッドロックと同じ「稼働中の復帰経路が無い」問題で、
+            #   従来は再起動でしか直らなかった。
+            #   見送りが続いたら feed を信じず取引所で裏を取り、(a)空なら feed 陳腐化として続行、
+            #   (b)本当に残っていればその場で取消す。取得失敗時は従来どおり見送る(fail-closed)。
+            if self._skip_streak >= int(self.cfg.get("feed_distrust_after_skips", 3)):
+                try:
+                    live = leg.exec.list_open_maker_orders()
+                except Exception:
+                    live = None
+                if live is not None and not live:
+                    log(f"{leg.name} feed は指値生存({sorted(oids)})と言うが取引所は空"
+                        f" → feed 陳腐化とみなして続行")
+                    return False
+                if live:
+                    log(f"{leg.name} 孤児 resting を検出 {live} → その場で取消す(稼働中の復帰)")
+                    for _s, oid in live:
+                        self._pp_cancel_verified(leg, int(oid))
+                    return True
             log(f"{leg.name} 板に自分の指値が生存(feed) {sorted(oids)} → handshakeせず見送り")
             return True
         szi = self._pp_feed_filled(leg)
@@ -661,18 +683,72 @@ class XVenueHedge:
         self._startup_reconcile()  # reduce-only中心=idempotent。flatならno-op
         return self._venues_flat()
 
+    def _plan_sizes(self, t_bid: float, t_ask: float) -> dict:
+        """1サイクルの脚別サイズを決める(2026-07-27 C5)。
+
+        3脚構成:
+            perpl BTC  +size_lead     txflow BTC -size_tx   → BTC 残差 = lead - tx
+            perpl ETH  -size_eth                            → 残差を ETH で中立化
+
+        ★ETH サイズは config の名目($130 等)から直接引かない。**丸め後の BTC 残差**から出す。
+          size_decimals が会場・銘柄で違う(txflow BTC=4 / perpl BTC=5 / perpl ETH=3)ため、
+          名目から引くと丸め後の実残差とズレて、その差がそのまま裸デルタになる。
+
+        hedge_leg_enabled=false、または lead==txflow(残差0)のときは ETH 脚を持たない
+        = **現行2脚と厳密に等価**。カナリアのレバーは lead_notional_usd そのもの。"""
+        btc_mid = (t_bid + t_ask) / 2
+        tx_notional = float(self.notional)
+        lead_notional = float(self.cfg.get("lead_notional_usd", tx_notional) or tx_notional)
+        if lead_notional < tx_notional:
+            lead_notional = tx_notional          # lead < txflow は設計外(残差が負になる)
+        size_lead = round(lead_notional / btc_mid, self._size_round)
+        size_tx = round(tx_notional / btc_mid, self._size_round)
+        out = {"btc_mid": btc_mid, "size_lead": size_lead, "size_tx": size_tx,
+               "size_eth": 0.0, "resid_usd": 0.0, "eth_mid": None}
+        if self.hedge_leg is None:
+            return out
+        resid_sz = round(size_lead - size_tx, self._size_round)
+        if resid_sz <= 0:
+            return out                            # 残差なし=2脚と等価
+        resid_usd = resid_sz * btc_mid
+        e_bid, e_ask = self._perpl_bbo(self.hedge_leg)
+        eth_mid = (e_bid + e_ask) / 2
+        hr = float(self.cfg.get("hedge_ratio", 1.0) or 1.0)
+        size_eth = round(resid_usd * hr / eth_mid, self._sr_hedge)
+        out.update(size_eth=size_eth, resid_usd=resid_usd, eth_mid=eth_mid)
+        return out
+
+    def _perpl_hedge_follow(self, is_buy: bool, size: float):
+        """perpl ETH ヘッジ脚の follow。`_perpl_maker_lead` の**薄いラッパ**(2026-07-27 C5)。
+
+        ★独自の発注ループを書かないこと。`_perpl_maker_lead` には取消×約定レース防御・
+          部分約定 grace・timeout 時の部分建玉回収が全部入っており、書き直せば
+          2026-07-25 の事故(建玉2倍化・6.5時間停止)が確実に再発する。違いは timeout だけ。"""
+        if self.hedge_leg is None or size <= 0:
+            return False, None
+        t = float(self.cfg.get("perpl_hedge_timeout_seconds", 120))
+        return self._perpl_maker_lead(self.hedge_leg, is_buy, size, timeout_s=t)
+
     def _run_cycle_live(self, dir_buy: bool) -> dict:
         """改善①②③(2026-07-23): perpl maker を先行(patient+requote)、txflow を追従(maker→taker)。
         perpl maker率↑・追従taker落ちしても安いtxflow(4.5)<perpl(6.9)。close時perpl reduce-only。fail-closed。
-        (旧: txflow先行→perpl追従はperpl taker落ち76%)。"""
+        (旧: txflow先行→perpl追従はperpl taker落ち76%)。
+
+        ★2026-07-27 C5: 3脚化。perpl BTC を txflow より大きく建て、残差を perpl ETH で相殺する。
+          脚順は **逐次**(perpl BTC lead → txflow → perpl ETH)。並行発注はしない —
+          txflow follow は ~8秒 / perpl ETH follow は中央値50秒でレイテンシが桁違いなので
+          並行化しても全体の6%しか縮まらず、perpl のトークンバケットが実質の直列化装置になる。
+          ETH が不成立なら **全畳み**(3脚とも即クローズ)。hold には入らない。"""
         lt = float(self.cfg["leg_timeout_seconds"])
         poll = float(self.cfg["poll_interval_seconds"])
         t_bid, t_ask = self._txflow_bbo()
-        size = round(self.notional / ((t_bid + t_ask) / 2), self._size_round)  # 両会場の粗い方(HYPE=txflow sd1)に丸め裸デルタ回避
+        plan = self._plan_sizes(t_bid, t_ask)
+        size = plan["size_tx"]                    # txflow 脚のサイズ(以降の txflow ロジックは不変)
+        size_lead = plan["size_lead"]             # perpl BTC lead のサイズ(2脚時は size と同じ)
 
         # === OPEN: perpl maker LEAD(patient+requote) ===
         perpl_is_buy = not dir_buy
-        pp_filled, pp_open_px = self._perpl_maker_lead(self.lead_leg, perpl_is_buy, size)
+        pp_filled, pp_open_px = self._perpl_maker_lead(self.lead_leg, perpl_is_buy, size_lead)
         if not pp_filled:
             return {"skip": "perpl_lead_no_fill"}   # 建玉なし=安全に見送り
 

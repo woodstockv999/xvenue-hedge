@@ -41,9 +41,27 @@ class _FakeAccountFeed:
 
 
 class _FakeExec:
-    def __init__(self, szi=0.0, position=None, raises=False):
+    def __init__(self, szi=0.0, position=None, raises=False, open_orders=None,
+                 market_px=None, market_raises=False):
         self._szi, self._position, self._raises = szi, position, raises
+        self._open_orders = open_orders
+        self._market_px, self._market_raises = market_px, market_raises
+        self.cancelled = []
         self.calls = []
+        self.orders = []          # place_order の履歴 (is_buy, size, reason, reduce_only)
+
+    def place_order(self, is_buy, size, reason, reduce_only):
+        self.orders.append((is_buy, size, reason, reduce_only))
+        if self._market_raises and not reduce_only:
+            raise RuntimeError("perpl: 成行注文の全量約定を確認できなかった")
+        return {"price": self._market_px, "sz": size}
+
+    def list_open_maker_orders(self):
+        self.calls.append("list_open_maker_orders")
+        return self._open_orders
+
+    def cancel_order(self, oid):
+        self.cancelled.append(oid)
 
     def get_position_szi(self):
         self.calls.append("get_position_szi")
@@ -72,6 +90,9 @@ class _FakeMarket:
     def get_best_bid_ask(self):
         self.rest_calls += 1
         return self._bbo
+
+    def round_size(self, size, for_reduce_only=False):
+        return round(size, self.size_decimals)
 
 
 def make_leg(symbol, market_id, price_decimals, size_decimals,
@@ -102,6 +123,7 @@ def make_bot(legs, account=None, tx_position=0.0):
     bot.pp_account = account or _FakeAccountFeed()
     bot.cfg = {}
     bot.dry_run = False
+    bot._skip_streak = 0        # feed 不信の発火判定に使う(_pp_entry_blocked)
     bot._tx_position = lambda: tx_position
     return bot
 
@@ -220,3 +242,238 @@ def test_venues_flat_false_when_txflow_has_position():
     acct = _FakeAccountFeed(positions={1: {"szi": 0.0}})
     bot = make_bot([make_leg("BTC", 1, 1, 5)], account=acct, tx_position=0.004)
     assert bot._venues_flat() is False
+
+
+def test_entry_blocked_recovers_from_stale_feed():
+    """★実害回帰(2026-07-27): feed が消えた指値を返し続けて約3時間停止した。
+
+    見送りが続いたら取引所に問い合わせ、**空なら feed 陳腐化とみなして続行**する。
+    これが無いと再起動でしか復帰できない。"""
+    acct = _FakeAccountFeed(oids={1: [5945875300366]})     # feed は「生存」と言う
+    leg = make_leg("BTC", 1, 1, 5, exec_=_FakeExec(open_orders=[]))  # 取引所は空
+    bot = make_bot([leg], account=acct)
+
+    bot._skip_streak = 0
+    assert bot._pp_entry_blocked(leg) is True, "見送りが浅いうちは feed を信じる"
+
+    bot._skip_streak = 5
+    assert bot._pp_entry_blocked(leg) is False, "取引所が空なら続行すべき"
+
+
+def test_entry_blocked_cancels_real_orphan_while_running():
+    """稼働中に**本物の孤児 resting**があればその場で取消す(従来は再起動が必要だった)。"""
+    acct = _FakeAccountFeed(oids={1: [999]})
+    ex = _FakeExec(open_orders=[("perpl:BTC", 999)])
+    leg = make_leg("BTC", 1, 1, 5, exec_=ex)
+    bot = make_bot([leg], account=acct)
+    bot._skip_streak = 5
+    assert bot._pp_entry_blocked(leg) is True
+    assert 999 in ex.cancelled, "孤児 resting を取り消していない"
+
+
+def test_entry_blocked_stays_blocked_when_exchange_unreadable():
+    """取引所に問い合わせられないときは従来どおり見送る(fail-closed)。"""
+    acct = _FakeAccountFeed(oids={1: [777]})
+    ex = _FakeExec(open_orders=None)          # 取得失敗
+    leg = make_leg("BTC", 1, 1, 5, exec_=ex)
+    bot = make_bot([leg], account=acct)
+    bot._skip_streak = 5
+    assert bot._pp_entry_blocked(leg) is True
+
+
+# --------------------------------------------------------------------------- 3脚(C5)
+def _bot_for_plan(hedge=True, lead=190.0, tx=150.0, hr=1.0, eth_bbo=(1957.0, 1957.5)):
+    btc = make_leg("BTC", 1, 1, 5)
+    eth = make_leg("ETH", 20, 2, 3, market_bbo=eth_bbo) if hedge else None
+    bot = make_bot([btc] + ([eth] if eth else []))
+    bot.notional = tx
+    bot._size_round = 4          # txflow BTC sd=4 と perpl BTC sd=5 の粗い方
+    bot._sr_hedge = 3            # perpl ETH sd=3
+    bot.cfg = {"lead_notional_usd": lead, "hedge_ratio": hr}
+    if not hedge:
+        bot.hedge_leg = None
+    return bot
+
+
+def test_plan_sizes_no_hedge_leg_is_two_leg():
+    """hedge_leg が無ければ ETH サイズ 0 = 現行2脚と等価。"""
+    bot = _bot_for_plan(hedge=False)
+    p = bot._plan_sizes(65000.0, 65002.0)
+    assert p["size_eth"] == 0.0
+
+
+def test_plan_sizes_zero_residual_when_lead_equals_txflow():
+    """★カナリアの土台: lead == txflow なら残差0 → ETH 脚が構造的に不在。"""
+    bot = _bot_for_plan(lead=150.0, tx=150.0)
+    p = bot._plan_sizes(65000.0, 65002.0)
+    assert p["size_lead"] == p["size_tx"]
+    assert p["size_eth"] == 0.0
+
+
+def test_plan_sizes_eth_comes_from_rounded_residual():
+    """★ETH サイズは config の名目でなく**丸め後の BTC 残差**から出す。
+
+    名目から引くと、丸め後の実残差とズレた分がそのまま裸デルタになる。"""
+    bot = _bot_for_plan(lead=190.0, tx=150.0)
+    mid = 65001.0
+    p = bot._plan_sizes(65000.0, 65002.0)
+    resid_sz = round(p["size_lead"] - p["size_tx"], 4)
+    assert p["resid_usd"] == pytest.approx(resid_sz * mid, rel=1e-9)
+    # ETH notional が BTC 残差と一致(hedge_ratio=1.0)
+    assert p["size_eth"] * p["eth_mid"] == pytest.approx(p["resid_usd"], rel=0.01)
+
+
+def test_plan_sizes_respects_hedge_ratio():
+    bot = _bot_for_plan(lead=190.0, tx=150.0, hr=0.5)
+    p = bot._plan_sizes(65000.0, 65002.0)
+    assert p["size_eth"] * p["eth_mid"] == pytest.approx(p["resid_usd"] * 0.5, rel=0.02)
+
+
+def test_plan_sizes_lead_below_txflow_is_clamped():
+    """lead < txflow は設計外(残差が負)。txflow に丸めて2脚に落とす。"""
+    bot = _bot_for_plan(lead=100.0, tx=150.0)
+    p = bot._plan_sizes(65000.0, 65002.0)
+    assert p["size_lead"] == p["size_tx"]
+    assert p["size_eth"] == 0.0
+
+
+def test_plan_sizes_eth_size_uses_eth_decimals():
+    """ETH のサイズ丸めは ETH の size_decimals(3)で行う(BTC の5ではない)。"""
+    bot = _bot_for_plan(lead=190.0, tx=150.0)
+    p = bot._plan_sizes(65000.0, 65002.0)
+    assert p["size_eth"] == round(p["size_eth"], 3)
+
+
+# ------------------------------------------------------- ヘッジ脚 taker フォールバック(2026-07-28)
+# ★実害回帰: maker 一本槍だと ETH follow が **40%(49/122)不成立**で、その全部が hold に入らず
+#   即クローズ = 積みたい OI が4割の周回で消えていた。さらに部分約定→unwind のコストは
+#   台帳にも口座ガードにも 1ドルも現れていなかった。
+def _hedge_bot(exec_=None, taker_fallback=True):
+    btc = make_leg("BTC", 1, 1, 5)
+    eth = make_leg("ETH", 20, 2, 3, exec_=exec_ or _FakeExec(market_px=1958.0))
+    bot = make_bot([btc, eth])
+    bot._sr_hedge = 3
+    bot.cfg = {"perpl_hedge_timeout_seconds": 120,
+               "perpl_hedge_taker_fallback": taker_fallback}
+    return bot
+
+
+def _stub_maker(bot, result, seen):
+    def _fake(leg, is_buy, size, timeout_s=None, keep_partial=False):
+        seen.append({"leg": leg.symbol, "size": size, "timeout_s": timeout_s,
+                     "keep_partial": keep_partial})
+        return result
+    bot._perpl_maker_lead = _fake
+
+
+def test_maker_lead_returns_three_tuple():
+    """★契約: (filled, px, got_sz)。2要素に戻すと呼び側が黙って壊れる。"""
+    acct = _FakeAccountFeed(oids={1: [1]})       # entry_blocked=True で即 return させる
+    leg = make_leg("BTC", 1, 1, 5)
+    bot = make_bot([leg], account=acct)
+    bot.cfg = {"perpl_lead_timeout_seconds": 1, "requote_interval_seconds": 12,
+               "poll_interval_seconds": 5}
+    assert bot._perpl_maker_lead(leg, True, 0.001) == (False, None, 0.0)
+
+
+def test_hedge_full_maker_fill_does_not_take():
+    bot = _hedge_bot()
+    seen = []
+    _stub_maker(bot, (True, 1957.0, 0.02), seen)
+    ok, px, got, took, ab = bot._perpl_hedge_follow(True, 0.02)
+    assert (ok, px, got, took, ab) == (True, 1957.0, 0.02, False, None)
+    assert bot.hedge_leg.exec.orders == [], "maker で埋まっているのに taker を打っている"
+    assert seen[0]["keep_partial"] is True
+
+
+def test_hedge_partial_maker_is_completed_by_taker():
+    """★本丸: 0.001/0.02 の部分約定を**捨てずに**残り 0.019 を taker で埋める。"""
+    ex = _FakeExec(market_px=1958.0)
+    bot = _hedge_bot(exec_=ex)
+    _stub_maker(bot, (False, 1957.0, 0.001), [])
+    ok, px, got, took, ab = bot._perpl_hedge_follow(True, 0.02)
+    assert ok is True and took is True and ab is None
+    assert got == pytest.approx(0.02)
+    assert ex.orders == [(True, 0.019, "hedge_taker", False)]
+    # open 価格は約定加重平均(片方の価格で全量計上すると損益の捏造になる)
+    assert px == pytest.approx((1957.0 * 0.001 + 1958.0 * 0.019) / 0.02)
+
+
+def test_hedge_zero_maker_fill_is_all_taker():
+    ex = _FakeExec(market_px=1958.0)
+    bot = _hedge_bot(exec_=ex)
+    _stub_maker(bot, (False, 1957.0, 0.0), [])
+    ok, px, got, took, ab = bot._perpl_hedge_follow(True, 0.02)
+    assert (ok, took, got) == (True, True, 0.02)
+    assert ex.orders == [(True, 0.02, "hedge_taker", False)]
+    assert px == pytest.approx(1958.0), "maker 約定0なら taker 価格そのもの"
+
+
+def test_hedge_taker_failure_unwinds_partial_and_reports_cost():
+    """★taker も失敗したら maker 部分建玉を必ず畳む(裸で残さない)。
+
+    そのコストを abort dict で返す — 従来は unwind が戻り値を持たず、
+    このコストが台帳から丸ごと消えていた。"""
+    ex = _FakeExec(market_px=1956.0, market_raises=True)
+    bot = _hedge_bot(exec_=ex)
+    bot.dirty = False
+    _stub_maker(bot, (False, 1957.0, 0.001), [])
+    ok, px, got, took, ab = bot._perpl_hedge_follow(True, 0.02)
+    assert ok is False and took is False
+    assert ab is not None and ab["sz"] == pytest.approx(0.001) and ab["px"] == 1957.0
+    assert (False, 0.001, "unwind", True) in ex.orders, "部分建玉を畳んでいない"
+    assert bot.dirty is True
+
+
+def test_hedge_taker_fallback_can_be_disabled():
+    """kill switch: false なら従来動作(maker のみ・部分約定は畳んで見送り)。"""
+    ex = _FakeExec(market_px=1958.0)
+    bot = _hedge_bot(exec_=ex, taker_fallback=False)
+    seen = []
+    _stub_maker(bot, (False, None, 0.0), seen)
+    assert bot._perpl_hedge_follow(True, 0.02) == (False, None, 0.0, False, None)
+    assert ex.orders == []
+    assert seen[0]["keep_partial"] is False, \
+        "fallback 無効なのに建玉を残している(畳み手がいなくなる)"
+
+
+def test_hedge_unreadable_position_does_not_take():
+    """★fail-closed: maker 後の建玉が読めない(429)ときに taker を打つと**過剰ヘッジ**になる。
+
+    `_pp_szi` は 429 で 0.0 に fail-open するので、部分建玉を『0約定』と誤読したまま
+    全量を taker で上塗りする経路が実在した。got=None(判定不能)で止める。"""
+    ex = _FakeExec(market_px=1958.0)
+    bot = _hedge_bot(exec_=ex)
+    bot.dirty = False
+    _stub_maker(bot, (False, 1957.0, None), [])
+    assert bot._perpl_hedge_follow(True, 0.02) == (False, None, 0.0, False, None)
+    assert ex.orders == [], "建玉不明なのに taker を打っている"
+    assert bot.dirty is True
+
+
+def test_maker_lead_returns_none_size_when_position_unreadable():
+    """keep_partial 経路は strict 読み。読めなければ 0.0 でなく None を返す。"""
+    acct = _FakeAccountFeed(positions={})
+    leg = make_leg("ETH", 20, 2, 3, exec_=_FakeExec(raises=True))
+    bot = make_bot([leg], account=acct)
+    bot.dirty = False
+    bot.cfg = {"perpl_lead_timeout_seconds": 0, "requote_interval_seconds": 12,
+               "poll_interval_seconds": 0}
+    ok, _px, got = bot._perpl_maker_lead(leg, True, 0.02, timeout_s=0, keep_partial=True)
+    assert ok is False and got is None
+    assert bot.dirty is True
+
+
+def test_hedge_follow_uses_hedge_timeout_not_lead():
+    bot = _hedge_bot()
+    seen = []
+    _stub_maker(bot, (True, 1957.0, 0.02), seen)
+    bot._perpl_hedge_follow(True, 0.02)
+    assert seen[0]["timeout_s"] == 120
+
+
+def test_hedge_follow_noop_without_hedge_leg():
+    bot = _hedge_bot()
+    bot.hedge_leg = None
+    assert bot._perpl_hedge_follow(True, 0.02) == (False, None, 0.0, False, None)
+    assert bot._perpl_hedge_follow(True, 0.0) == (False, None, 0.0, False, None)

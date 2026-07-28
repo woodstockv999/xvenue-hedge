@@ -786,7 +786,11 @@ class XVenueHedge:
         hedge_leg_enabled=false、または lead==txflow(残差0)のときは ETH 脚を持たない
         = **現行2脚と厳密に等価**。カナリアのレバーは lead_notional_usd そのもの。"""
         btc_mid = (t_bid + t_ask) / 2
-        tx_notional = float(self.notional)
+        # ★txflow 脚を切る(2026-07-29): txflow の証拠金が床($55)を割って自己ハルトしたため、
+        #   ユーザー判断で txflow を退役。残るのは **perpl BTC + perpl ETH** = 2026-07-22 に
+        #   効率 8,978 を出した構成そのもの。txflow 名目を 0 にすると残差 = lead 全額となり、
+        #   ETH が lead を丸ごとヘッジする(下の resid_sz 計算がそのまま成立する)。
+        tx_notional = float(self.notional) if self.cfg.get("txflow_leg_enabled", True) else 0.0
         lead_notional = float(self.cfg.get("lead_notional_usd", tx_notional) or tx_notional)
         if lead_notional < tx_notional:
             lead_notional = tx_notional          # lead < txflow は設計外(残差が負になる)
@@ -830,11 +834,20 @@ class XVenueHedge:
         leg = self.hedge_leg
         t = float(self.cfg.get("perpl_hedge_timeout_seconds", 120))
         use_taker = bool(self.cfg.get("perpl_hedge_taker_fallback", True))
-        ok, px, got = self._perpl_maker_lead(leg, is_buy, size, timeout_s=t,
-                                             keep_partial=use_taker)
+        # ★keep_partial は **常に True**(2026-07-29)。use_taker=False のときも部分建玉を
+        #   自分で畳んでコストを台帳に持ち帰るため。`_perpl_maker_lead` 内の
+        #   `_pp_partial_abort` に任せると unwind の約定を捨ててしまい、2026-07-28 に塞いだ
+        #   「abort コストが台帳にも口座ガードにも1ドルも出ない」穴が再発する。
+        ok, px, got = self._perpl_maker_lead(leg, is_buy, size, timeout_s=t, keep_partial=True)
         if ok:
             return True, px, size, False, None
         if not use_taker:
+            # maker 一本槍(= 2026-07-22 に効率 8,978 を出した pair_hedge と同じ経済)。
+            # 部分建玉は畳み、そのコストを abort dict で返す。
+            if got and got > 1e-8:
+                ab = self._perpl_unwind(leg, is_buy, got)
+                self.dirty = True
+                return False, px, got, False, {"px": px, "sz": got, "unwind": ab}
             return False, None, 0.0, False, None
         if got is None:      # 建玉が読めない(429等)。taker で上塗りすると過剰ヘッジになる
             log(f"⚠️ {leg.name} hedge: maker 後の建玉が判定不能 → taker を打たない(fail-closed)")
@@ -890,8 +903,17 @@ class XVenueHedge:
         tx_is_buy = dir_buy
         htry = float(self.cfg.get("follow_maker_try_seconds", 3.0))
         frq = float(self.cfg.get("follow_maker_requote_seconds", 1.5))
-        t_bid, t_ask = self._txflow_bbo()
-        tx_fill, tx_taker, mpx = None, False, (t_bid if tx_is_buy else t_ask)
+        # ★txflow 退役(2026-07-29): size==0 なら txflow に一切触らない。以降の txflow ブロックは
+        #   すべて `if tx_on:` で括る。size 0 で発注すると reject/例外になるので**必ずガードする**。
+        tx_on = size > 1e-12
+        if tx_on:
+            t_bid, t_ask = self._txflow_bbo()
+            tx_fill, tx_taker, mpx = None, False, (t_bid if tx_is_buy else t_ask)
+        else:
+            # 以降の損益/出来高計算がそのまま通るように**中立な0約定**を入れる
+            # (px=0・sz=0 なので pnl も volume も 0 に落ちる)。
+            tx_fill = {"px": 0.0, "sz": 0.0, "fee": 0.0}
+            tx_taker, mpx = False, 0.0
 
         # --- ① 短時間 maker試行(post_only + requote。建玉で裏取り) ---
         # ★取消×約定レース防御(2026-07-25。pair_hedge が 2026-07-12 の事故で入れた多層防御の移植):
@@ -899,7 +921,11 @@ class XVenueHedge:
         #   次の reduce_only=False を置いていた**。両方刺さると建玉2倍=片方が裸デルタになる
         #   (07-25 17:36 に `startup_reconcile: txflow 0.0046 をフラット化`=2×size で実観測)。
         #   不変条件を2つ課す: (a)生きた指値を同時に2本持たない (b)過去identの約定も必ず回収する。
-        ident, last_place, hdl = None, 0.0, time.time() + htry
+        # ★tx_on=False のとき hdl=0 で maker ループが1度も回らない。後続の `if not tx_fill:`
+        #   (残resting取消 / taker フォールバック)は tx_fill に 0約定 dict が入っているので
+        #   truthy = 自動的にスキップされる。**ブロックを丸ごとインデントし直さないための構造**。
+        ident, last_place = None, 0.0
+        hdl = (time.time() + htry) if tx_on else 0.0
         open_idents = []          # このサイクルでopenに使った全ident(取消空振り分の回収用)
         cancel_pending = False    # 取消を送ったが板から消えたことを未確認=**再発注してはいけない**
         # ★join offset(2026-07-28): 板の内側に置く(_tx_join_px の docstring 参照)。
@@ -1089,11 +1115,11 @@ class XVenueHedge:
         # ★超過建玉ガード: 上の防御を抜けても size を超えていたら**その場で削る**
         #   (perpl脚は size しかヘッジしていないので、超過分はそのまま裸デルタになる)。
         try:
-            pos_chk = self._tx_position()
+            pos_chk = self._tx_position() if tx_on else 0.0
         except Exception:
             pos_chk = 0.0
         excess = round(abs(pos_chk) - size, self._size_round)
-        if excess > size * 0.05:
+        if tx_on and excess > size * 0.05:
             log(f"⚠️ txflow open: 建玉超過 {abs(pos_chk)} > size {size} → 超過{excess}をreduce-onlyで削る")
             try:
                 t_b, t_a = self._txflow_bbo()
@@ -1140,7 +1166,7 @@ class XVenueHedge:
         # ★3脚化で **perpl BTC lead も監視対象**にする。lead が2倍化すると lead ぶん丸ごと
         #   裸になる(txflow と ETH は元のサイズしかヘッジしていない)。2026-07-12 事故の直系。
         chk_s = float(self.cfg.get("hold_position_check_seconds", 30))
-        _watch = [(None, size)]                      # (leg, 期待サイズ)。None=txflow
+        _watch = [(None, size)] if tx_on else []      # (leg, 期待サイズ)。None=txflow
         _watch.append((self.lead_leg, size_lead))
         if eth_filled:
             _watch.append((self.hedge_leg, size_eth))
@@ -1186,9 +1212,17 @@ class XVenueHedge:
         # === CLOSE: txflow reduce(maker→taker) + perpl reduce-only ===
         tx_close_buy = not tx_is_buy
         crq = float(self.cfg.get("close_requote_seconds", 5))
-        t_bid2, t_ask2 = self._txflow_bbo()
-        tx_cpx = t_bid2 if tx_close_buy else t_ask2
-        tx_cfill, cid, last_place, dl = None, None, 0.0, time.time() + lt
+        # ★txflow 退役時(tx_on=False)は板も引かない。dl=0 で close ループも回らず、
+        #   tx_cfill に 0約定を入れて後続の `if not tx_cfill:` を全部スキップさせる。
+        if tx_on:
+            t_bid2, t_ask2 = self._txflow_bbo()
+            tx_cpx = t_bid2 if tx_close_buy else t_ask2
+            tx_cfill = None
+        else:
+            t_bid2 = t_ask2 = tx_cpx = 0.0
+            tx_cfill = {"px": 0.0, "sz": 0.0, "fee": 0.0, "recovered": True}
+        cid, last_place = None, 0.0
+        dl = (time.time() + lt) if tx_on else 0.0
         # ★このサイクルでcloseに使った全ident(requoteで捨てた分も含む)。取消×約定レースで
         #   「取消したつもりの指値が約定していた」場合に実約定を回収するために必要
         #   (2026-07-25: 保持していなかったため19%のサイクルでclose価格を捏造していた)。
@@ -1329,7 +1363,11 @@ class XVenueHedge:
                 "pnl": round(pp_pnl, 5), "fees_usd": round(pp_fee, 6),
                 "open_maker": True, "close_recovered": pp_close_ok,
             },
-            f"txflow:{self.symbol}": {
+        }
+        # ★txflow 退役時は脚そのものを載せない(2026-07-29)。size 0 の脚を残すと会場別集計に
+        #   出来高0の txflow 行が混ざり、taker 率や bps の分母が壊れる。
+        if tx_on:
+            legs[f"txflow:{self.symbol}"] = {
                 "venue": "txflow", "symbol": self.symbol, "role": "follow",
                 "is_buy": tx_is_buy, "size": tx_osz,
                 "open_px": tx_o, "close_px": tx_c,
@@ -1337,8 +1375,7 @@ class XVenueHedge:
                 "pnl": round(tx_pnl, 5), "fees_usd": round(tx_fee, 6),
                 "open_maker": not tx_taker,
                 "close_recovered": bool(tx_cfill.get("recovered", True)),
-            },
-        }
+            }
         if eth_filled:
             legs[f"perpl:{self.hedge_leg.symbol}"] = {
                 "venue": "perpl", "symbol": self.hedge_leg.symbol, "role": "hedge",
@@ -1468,7 +1505,11 @@ class XVenueHedge:
         # 1b. txflow 口座の証拠金(2026-07-27追加)。account_guard は両セルの**セルnet**を合算する
         #     ものなので perpl 口座も txflow 口座も残高としては見ていない。txflow は
         #     必要証拠金(notional/leverage)を割ると発注が通らなくなるだけで、誰も気づかない。
+        # ★txflow 退役時(txflow_leg_enabled: false)はこの床を見ない。見ると発注しない口座の
+        #   残高で**永久にハルトし続ける**(2026-07-29 に実際 $54.89 < $55 で 4.8時間停止した床)。
         min_eq = float(self.cfg.get("txflow_min_equity_usd", 0) or 0)
+        if not self.cfg.get("txflow_leg_enabled", True):
+            min_eq = 0.0
         if min_eq > 0 and not self.dry_run:
             eq = self._tx_equity()
             if eq is not None and eq < min_eq:

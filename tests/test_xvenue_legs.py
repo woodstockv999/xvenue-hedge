@@ -426,15 +426,20 @@ def test_hedge_taker_failure_unwinds_partial_and_reports_cost():
 
 
 def test_hedge_taker_fallback_can_be_disabled():
-    """kill switch: false なら従来動作(maker のみ・部分約定は畳んで見送り)。"""
+    """kill switch: false なら maker のみ・部分約定は畳んで見送り。
+
+    ★2026-07-29 に契約変更: `keep_partial` は **fallback の有無に関わらず常に True**。
+      畳むのは `_perpl_hedge_follow` 側の仕事にした — `_pp_partial_abort` に任せると
+      unwind の約定を捨ててしまい、abort コストが台帳から消えるため
+      (test_hedge_follow_maker_only_still_reports_abort_cost が本体)。"""
     ex = _FakeExec(market_px=1958.0)
     bot = _hedge_bot(exec_=ex, taker_fallback=False)
     seen = []
     _stub_maker(bot, (False, None, 0.0), seen)
     assert bot._perpl_hedge_follow(True, 0.02) == (False, None, 0.0, False, None)
-    assert ex.orders == []
-    assert seen[0]["keep_partial"] is False, \
-        "fallback 無効なのに建玉を残している(畳み手がいなくなる)"
+    assert ex.orders == [], "fallback 無効なのに taker を打っている"
+    assert seen[0]["keep_partial"] is True, \
+        "keep_partial を False に戻すと abort コストが台帳から消える"
 
 
 def test_hedge_unreadable_position_does_not_take():
@@ -536,3 +541,91 @@ def test_hedge_follow_noop_without_hedge_leg():
     bot.hedge_leg = None
     assert bot._perpl_hedge_follow(True, 0.02) == (False, None, 0.0, False, None)
     assert bot._perpl_hedge_follow(True, 0.0) == (False, None, 0.0, False, None)
+
+
+def test_join_offset_ab_alternates_by_cycle():
+    """★A/B: サイクルごとに腕を交互に割り当てる(時間帯交絡の除去)。
+
+    txflow の taker 率は時間帯で 25〜75% 振れるので、前後比較では効果が埋もれる。
+    同一時間帯で交互に振ることでのみ切り分けられる。"""
+    ab = [0, 1]
+    assigned = [ab[c % len(ab)] for c in range(6)]
+    assert assigned == [0, 1, 0, 1, 0, 1]
+
+
+def test_join_offset_ab_empty_falls_back_to_fixed():
+    """A/B を空にしたら固定値(follow_join_offset_ticks)に戻る = kill switch。"""
+    cfg = {"follow_join_offset_ab": [], "follow_join_offset_ticks": 1}
+    ab = cfg.get("follow_join_offset_ab") or []
+    joff = int(ab[0 % len(ab)]) if ab else int(cfg.get("follow_join_offset_ticks", 0) or 0)
+    assert joff == 1
+
+
+def test_ab_column_only_written_while_ab_runs():
+    """★A/B 打ち切り後に `join_offset_ab` を書き続けてはいけない。
+
+    書き続けると採用した腕だけが増えて他方が凍り、この列で集計する
+    scripts/ab_join_offset.py が**静かに偏る**(気づけない類の壊れ方)。"""
+    def joff_used(cfg, cycles):
+        ab = cfg.get("follow_join_offset_ab") or []
+        return int(ab[cycles % len(ab)]) if ab else None
+    assert joff_used({"follow_join_offset_ab": [0, 1]}, 0) == 0
+    assert joff_used({"follow_join_offset_ab": [0, 1]}, 1) == 1
+    assert joff_used({"follow_join_offset_ab": [], "follow_join_offset_ticks": 1}, 0) is None
+
+
+# ------------------------------------------------------- txflow 退役(2026-07-29)
+# ★07-29 02:20 に txflow equity $54.89 < 床$55 で自己ハルト(4.8時間停止)。入金しない方針なので
+#   txflow を切り、perpl BTC + perpl ETH(= 07-22 に効率 8,978 を出した構成)へ戻す。
+def test_plan_sizes_txflow_disabled_makes_eth_hedge_the_whole_lead():
+    """★txflow を切ると残差 = lead 全額 → ETH が lead を丸ごとヘッジする。"""
+    bot = _bot_for_plan(lead=190.0, tx=150.0)
+    bot.cfg["txflow_leg_enabled"] = False
+    p = bot._plan_sizes(65000.0, 65002.0)
+    assert p["size_tx"] == 0.0, "txflow サイズが残っている"
+    assert p["size_eth"] > 0, "ETH 脚が立っていない"
+    # ETH の名目が lead の名目と一致(hedge_ratio=1.0)
+    assert p["size_eth"] * p["eth_mid"] == pytest.approx(p["size_lead"] * p["btc_mid"], rel=0.02)
+
+
+def test_plan_sizes_txflow_enabled_is_unchanged():
+    """既定(true)は従来どおり残差だけを ETH でヘッジする = 完全な後方互換。"""
+    bot = _bot_for_plan(lead=190.0, tx=150.0)
+    bot.cfg["txflow_leg_enabled"] = True
+    p = bot._plan_sizes(65000.0, 65002.0)
+    assert p["size_tx"] > 0
+    assert p["size_eth"] * p["eth_mid"] == pytest.approx(p["resid_usd"], rel=0.02)
+
+
+def test_txflow_equity_floor_disabled_when_leg_retired():
+    """★発注しない口座の残高で**永久ハルト**してはいけない(4.8時間停止の直接原因)。"""
+    def floor(cfg):
+        m = float(cfg.get("txflow_min_equity_usd", 0) or 0)
+        return 0.0 if not cfg.get("txflow_leg_enabled", True) else m
+    assert floor({"txflow_min_equity_usd": 55, "txflow_leg_enabled": False}) == 0.0
+    assert floor({"txflow_min_equity_usd": 55, "txflow_leg_enabled": True}) == 55.0
+    assert floor({"txflow_min_equity_usd": 55}) == 55.0     # 既定は従来動作
+
+
+def test_hedge_follow_maker_only_still_reports_abort_cost():
+    """★taker フォールバックを切っても abort コストは台帳に返す。
+
+    切った途端に `_pp_partial_abort` 任せになると unwind の約定を捨て、2026-07-28 に塞いだ
+    「abort コストが台帳にも口座ガードにも1ドルも出ない」穴が再発する。"""
+    ex = _FakeExec(market_px=1956.0)
+    bot = _hedge_bot(exec_=ex, taker_fallback=False)
+    bot.dirty = False
+    _stub_maker(bot, (False, 1957.0, 0.004), [])
+    ok, px, got, took, ab = bot._perpl_hedge_follow(True, 0.02)
+    assert ok is False and took is False
+    assert ab is not None and ab["sz"] == pytest.approx(0.004), "abort コストを返していない"
+    assert (False, 0.004, "unwind", True) in ex.orders, "部分建玉を畳んでいない"
+    assert bot.dirty is True
+
+
+def test_hedge_follow_maker_only_does_not_take():
+    ex = _FakeExec(market_px=1958.0)
+    bot = _hedge_bot(exec_=ex, taker_fallback=False)
+    _stub_maker(bot, (False, 1957.0, 0.0), [])
+    assert bot._perpl_hedge_follow(True, 0.02) == (False, None, 0.0, False, None)
+    assert ex.orders == [], "fallback 無効なのに taker を打っている"

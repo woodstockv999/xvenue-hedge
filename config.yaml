@@ -110,6 +110,12 @@ follow_maker_try_seconds: 6.0    # 案②2026-07-24: open maker試行窓。8sは
 #   post_only 拒否時は touch へ落として粘る(いきなり taker にしない)。
 #   ★リスク: キュー先頭は逆選択も最初に受ける。taker率と価格bpsの両方で判定すること。
 follow_join_offset_ticks: 1
+# ★A/B(2026-07-28): サイクルごとに交互に振る。空 [] で A/B 停止 → follow_join_offset_ticks を使う。
+#   なぜ前後比較ではダメか: txflow の taker 率は**時間帯で 25〜75% 振れる**(07-28 時間別実測)。
+#   投入直後 n=16 は 43.4%→68.8% と逆に出たが、投入時刻がもともと 75% の時間帯だった。
+#   同一時間帯で交互に振らないと、この分散に効果が埋もれる。
+#   集計は台帳の `join_offset_ab` 列を持つ行だけで行う。
+follow_join_offset_ab: [0, 1]
 follow_maker_requote_seconds: 1.5  # requote1.0(8500狙い)は棄却(2026-07-24): taker落ちは価格ドリブン(taker群price-$0.026 vs maker-$0.013=adverse-selection検出器・pair_hedge abortと同構造)でタイミングでは消せず、taker率32%→40-48%へ逆に上昇→既知ベスト1.5へ復帰
 # 改善③: perplは共有IPのCF 1015制限=pair_hedgeと帯域競合。poll間隔を空けて429緩和。
 poll_interval_seconds: 5          # fills RESTポーリング間隔。5s=45sリードで最大9回(旧3s=15回)

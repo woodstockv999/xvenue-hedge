@@ -902,10 +902,20 @@ class XVenueHedge:
         ident, last_place, hdl = None, 0.0, time.time() + htry
         open_idents = []          # このサイクルでopenに使った全ident(取消空振り分の回収用)
         cancel_pending = False    # 取消を送ったが板から消えたことを未確認=**再発注してはいけない**
-        # ★join offset(2026-07-28): 既定で1tick内側に置く(_tx_join_px の docstring 参照)。
+        # ★join offset(2026-07-28): 板の内側に置く(_tx_join_px の docstring 参照)。
         #   post_only に拒否されたら **その場で touch(offset 0)へ落として粘る** — いきなり
         #   taker に落とすと、直そうとしている taker 率を自分で上げてしまう。
-        joff = int(self.cfg.get("follow_join_offset_ticks", 0) or 0)
+        # ★A/B(2026-07-28): txflow の taker 率は**時間帯で 25〜75% も振れる**(07-28 実測の
+        #   時間別)。前後比較ではこの分散に効果が埋もれる — 実際 join=+1tick の投入直後 n=16 は
+        #   43.4%→68.8% と逆に出たが、投入時刻がもともと 75% の時間帯だった。
+        #   **同一時間帯で交互に振る**ことでのみ切り分けられる。集計は `join_offset_ab` 列を持つ
+        #   行だけで行うこと([[pair-hedge-ab-null-and-broken-baseline]] と同じ規約)。
+        _ab = self.cfg.get("follow_join_offset_ab") or []
+        if _ab:
+            joff = int(_ab[self.cycles % len(_ab)])
+        else:
+            joff = int(self.cfg.get("follow_join_offset_ticks", 0) or 0)
+        joff_used = joff          # 台帳に残す値(途中で touch へ落ちても「割り当て」を記録する)
         while time.time() < hdl:
             if ident is None and not cancel_pending:
                 t_bid, t_ask = self._txflow_bbo()
@@ -1342,6 +1352,8 @@ class XVenueHedge:
             "size": size, "notional_usd": self.notional,
             "size_lead": size_lead, "lead_notional_usd": round(pp_open_px * size_lead, 4),
             "resid_usd": round(plan["resid_usd"], 4),
+            # ★A/B: この行がどちらの腕か。**この列がある行だけ**で集計すること。
+            "join_offset_ab": joff_used,
             "legs": legs,
             "txflow": tx_mirror, "perpl": pp_mirror,
             "fees_usd": round(fees, 6), "volume_usd": round(volume, 4), "net_usd": round(net, 6),

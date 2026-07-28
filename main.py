@@ -1408,6 +1408,10 @@ class XVenueHedge:
         # size/notional は脚別の実額。銘柄別・会場別の集計が全量約定を前提にしないためのもの
         # (2026-07-25: 部分約定を全量計上して台帳が汚れた実害の再発防止)。
         pp_mirror = {"open": round(pp_open_px, 1), "close": round(pp_close_px, 1),
+                     # ★`taker_hedge` は **lead 脚(常に maker)**を指す v1 の遺物で、恒久 False。
+                     #   ヘッジ脚が taker で埋まったかは v2 の `legs["perpl:ETH"].open_maker`
+                     #   を見ること。名前に釣られてここを読むと「taker を一度も使っていない」と
+                     #   誤読する(2026-07-29 に実際に誤読した)。
                      "pnl": round(pp_pnl, 5), "taker_hedge": False,
                      "size": size_lead, "notional": round(pp_open_px * size_lead, 4),
                      "close_recovered": pp_close_ok}

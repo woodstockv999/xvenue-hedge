@@ -39,7 +39,16 @@ APP = Path(__file__).resolve().parent.parent
 CYCLES = APP / "data" / "cycles.jsonl"
 
 
-def load(hours: float | None) -> list[dict]:
+# ★証拠金天井にぶつかっていた行を落とす閾値(2026-07-29)。
+#   A/B 開始直後は lead $190 で、perpl 2脚の必要証拠金 2×190/3 = $126.7 が equity $127.4 を
+#   実質超えており、**taker 腕の発注が全部 sr=44 で拒否されていた**。つまりその区間の
+#   「taker ON」は maker のみと同じ動作しかしておらず、混ぜると腕の差が薄まる
+#   ([[xvenue-margin-ceiling-silent-2026-07-29]])。`_margin_cap` 適用後は lead ≈ $143。
+#   ★落とした件数は必ず表示する。黙って捨てると「全部見た」に見える。
+_MARGIN_CAP_LEAD_MAX = 160.0
+
+
+def load(hours: float | None) -> tuple[list[dict], int]:
     rows = []
     for line in CYCLES.read_text().splitlines():
         line = line.strip()
@@ -54,10 +63,14 @@ def load(hours: float | None) -> list[dict]:
         if "hedge_taker_ab" not in r:      # A/B 割り当てのある行だけ
             continue
         rows.append(r)
+    n_all = len(rows)
+    rows = [r for r in rows
+            if float(r.get("lead_notional_usd") or 0) <= _MARGIN_CAP_LEAD_MAX]
+    dropped = n_all - len(rows)
     if hours and rows:
         newest = max(r.get("ts", 0) for r in rows)
         rows = [r for r in rows if r.get("ts", 0) >= newest - hours * 3600]
-    return rows
+    return rows, dropped
 
 
 def arm_stats(rows: list[dict]) -> dict:
@@ -87,7 +100,10 @@ def fmt_eff(s: dict) -> str:
 
 def main() -> None:
     hours = float(sys.argv[1]) if len(sys.argv) > 1 else None
-    rows = load(hours)
+    rows, dropped = load(hours)
+    if dropped:
+        print(f"※ 証拠金天井にぶつかっていた {dropped} 行を除外(lead > "
+              f"${_MARGIN_CAP_LEAD_MAX:.0f} = taker 腕の発注が拒否されていた区間)")
     if not rows:
         print("A/B 行が無い(config の perpl_hedge_taker_fallback_ab を確認)")
         return

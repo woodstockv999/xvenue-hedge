@@ -772,6 +772,46 @@ class XVenueHedge:
         self._startup_reconcile()  # reduce-only中心=idempotent。flatならno-op
         return self._venues_flat()
 
+    def _margin_cap(self, lead_notional: float, tx_notional: float) -> float:
+        """perpl 口座の証拠金で lead 名目を頭打ちにする(2026-07-29)。
+
+        ## なぜ要るか — 2026-07-29 に実際に踏んだ形
+        txflow を退役させた結果、ETH のヘッジ対象が残差$40 から **lead 全額$190** になった。
+        perpl は leverage 3x なので、hold 中は lead と hedge の両方の証拠金が同時に要る:
+
+            必要証拠金 = (lead + hedge) / 3 = 2 × 190 / 3 = $126.7   vs equity $127.4
+
+        余裕 $0.7。**ETH の発注が全部 sr=44 で拒否され、follow が 100% 不成立**になった。
+        観測できたのは「出来高が $765→$383 に半減」と「効率が変わらない」だけで、
+        原因を示すものは 60字で切られたログしか無かった。★口座が痩せると発注が黙って
+        拒否されるだけなので、**名目は equity から導け。固定値で書くな**。
+
+        ## 上限の出し方
+        equity ≥ (lead + hedge)/lev で hedge ≈ lead - tx なので
+            lead ≤ (equity × lev × 使用率 + tx) / 2
+        使用率は既定 0.75 — 残りは手数料・含み損・マーク変動の緩衝。
+        fail-open: equity が読めない/古いときは config の値をそのまま使う
+        (読めないことを理由に出来高farmを止めない = equity_floor_reason と同じ方針)。"""
+        util = float(self.cfg.get("perpl_margin_utilization", 0.75) or 0)
+        if util <= 0:
+            return lead_notional
+        eq = _pag.current_equity_usd()
+        if eq is None or eq <= 0:
+            return lead_notional
+        # ★`market.leverage` は存在しない(PerplMarketData が持つのは leverage_hundredths)。
+        #   _PERPL_MARKETS の生 config を持つ mcfg が正。
+        lev = float(self.lead_leg.mcfg.get("leverage", 0) or 0)
+        if lev <= 0:
+            return lead_notional
+        cap = (eq * lev * util + tx_notional) / 2.0
+        if cap >= lead_notional:
+            return lead_notional
+        if cap != getattr(self, "_last_margin_cap", None):
+            log(f"⚠️ 証拠金でlead名目を制限: ${lead_notional:.0f} → ${cap:.0f} "
+                f"(perpl equity ${eq:.2f} × lev {lev:.0f} × 使用率 {util:.0%})")
+            self._last_margin_cap = cap
+        return cap
+
     def _plan_sizes(self, t_bid: float, t_ask: float) -> dict:
         """1サイクルの脚別サイズを決める(2026-07-27 C5)。
 
@@ -794,6 +834,7 @@ class XVenueHedge:
         lead_notional = float(self.cfg.get("lead_notional_usd", tx_notional) or tx_notional)
         if lead_notional < tx_notional:
             lead_notional = tx_notional          # lead < txflow は設計外(残差が負になる)
+        lead_notional = self._margin_cap(lead_notional, tx_notional)
         size_lead = round(lead_notional / btc_mid, self._size_round)
         size_tx = round(tx_notional / btc_mid, self._size_round)
         out = {"btc_mid": btc_mid, "size_lead": size_lead, "size_tx": size_tx,
@@ -873,7 +914,10 @@ class XVenueHedge:
             r = leg.exec.place_order(is_buy, remain, "hedge_taker", reduce_only=False)
         except Exception as e:
             # taker も埋まらない。maker 部分建玉が裸で残るので必ず畳む(fail-closed)。
-            log(f"⚠️ {leg.name} taker フォールバック失敗={repr(e)[:60]}")
+            # ★切り詰めない(2026-07-29)。60字だと `perpl order rq=17…` で rq の数字に食われ、
+            #   拒否理由(証拠金不足なのか sr コードなのか)が**一切読めなかった**。
+            #   例外の全文を出すこと — 診断できないログはログでない。
+            log(f"⚠️ {leg.name} taker フォールバック失敗={e}")
             ab = self._perpl_unwind(leg, is_buy, got) if got > 1e-8 else None
             self.dirty = True
             return False, px, got, False, {"px": px, "sz": got, "unwind": ab}

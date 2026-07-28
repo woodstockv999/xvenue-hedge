@@ -31,10 +31,18 @@ lead_notional_usd: 190
 hedge_ratio: 1.00          # ETH 脚の名目倍率。gross 固定の分散最小比率は 180/300/600s とも
                            # ほぼ 1.0(実測: 0.978/0.987/1.024)。1800s まで伸ばすなら 1.10 へ再校正。
                            # ★pair_hedge の 1.21 は逆回帰の逆数を使った方法論エラーだった。
-perpl_hedge_timeout_seconds: 45   # ETH follow の **maker 試行**の猶予。ここで刺さらなければ taker。
-                           # ★2026-07-28: 120→45。hold_seconds を 90 に落としたので、120 のままだと
-                           #   ETH follow がサイクル長を支配して hold 短縮の効果が消える(hold_end は
-                           #   ETH follow より先に確定する)。lead 脚と同じ 45s に揃えた。
+perpl_hedge_timeout_seconds: 90   # ETH follow の **maker 試行**の猶予。ここで刺さらなければ taker。
+                           # ★2026-07-28 21:00: 45→90(= hold_seconds)。**サイクル時間はゼロコスト**。
+                           #   hold_end は ETH follow より先に確定するので、ETH の試行は hold 窓の
+                           #   *内側*で走る。90s まで伸ばしても gap は変わらず、減るのは hold 残り
+                           #   (=OI)だけ。効率優先の方針なので OI は許容する。
+                           #   狙い: ETH の **open は 64% が taker**(実測 fee 2.36bps。maker 0.45 /
+                           #   taker 3.45 bps-of-volume の混合から逆算)。手数料の 17.4% を占める。
+                           #   猶予 120s のときの maker 率は 58% だったので、90s なら ~52% を見込む。
+                           # ★perpl ETH の板は **1tick 幅**(実測)なので、txflow で効いた
+                           #   「板の内側に置く」(follow_join_offset_ticks)は使えない。時間で稼ぐしかない。
+                           # 旧: 45(hold 短縮に合わせて lead と揃えたが、hold 窓の内側で走ることを
+                           #     見落としており、縮める必要が無かった)。
                            # 代償: maker 約定率が下がり taker 比率が上がる(t120 で 58%)。1件 $0.023 なので
                            #   全件 taker でも $0.023×18cycle/h×24 = $9.9/日。gap 415→~200s の
                            #   net +2$/h(=+$48/日)に対して十分小さい。
@@ -99,7 +107,19 @@ leg_timeout_seconds: 40          # closeのtxflow maker猶予。15→40(案①20
 taker_cross_bps: 8.0
 # hybrid追従(2026-07-24): perpl裸窓中にtxflow makerを短時間試す→刺されば1.5bps(taker4.5より3bps安)。
 # 刺さらなければtakerで裸窓を閉じる。裸窓が最大try秒に延びる代償でfee削減。
-follow_maker_try_seconds: 6.0    # 案②2026-07-24: open maker試行窓。8sは実測で6sに劣後(taker_follow直近14=43%>直近25=32%・eff5738<6902、n=14ノイズ含むが押し上げ効果なし)→6sへ戻す。厚いtxflow BTC板の追従脚は価格が寄らねばmaker不成立=窓延長は裸窓を延ばすだけで最後taker
+follow_maker_try_seconds: 12.0   # ★2026-07-28 21:00: 6→12。**手数料の 65.6% が txflow 脚**で、
+                           #   open の 37% が taker(4.5bps)。ここが効率の最大レバー。
+                           # ★8s 棄却(下記)を覆す根拠2つ:
+                           #   (1) あの判定は **n=14 の前後比較**。txflow の taker 率は時間帯で
+                           #       25〜75% 振れる(07-28 実測)ので、この n では符号すら決まらない
+                           #       (実際 join offset は前後比較で効果が逆に出た)。
+                           #   (2) 棄却理由「価格が寄らねば maker 不成立=窓延長は裸窓を延ばすだけ」は
+                           #       **touch に並んでいた頃の力学**。今は follow_join_offset_ticks:1 で
+                           #       板の内側=列の先頭にいるので、対向フローが来れば刺さる。
+                           #       「待てば当たる」に変わったので、時間を伸ばす意味が生まれた。
+                           # 代償: 裸窓(perpl $190 が無ヘッジ)が最大6秒延びる。価格成分は損失の
+                           #   17% しかなく(手数料83%)、6秒の BTC σ は約1.7bps=$0.032 で期待値ゼロ。
+                           # 旧: 6.0 — 案②2026-07-24: open maker試行窓。8sは実測で6sに劣後(taker_follow直近14=43%>直近25=32%・eff5738<6902、n=14ノイズ含むが押し上げ効果なし)→6sへ戻す。厚いtxflow BTC板の追従脚は価格が寄らねばmaker不成立=窓延長は裸窓を延ばすだけで最後taker
 # ★2026-07-28: txflow follow の maker を **板の1tick内側**に置く(0=従来のtouch並び)。
 #   実測: txflow BTC のスプレッドは 15/15 サンプルで常に 2tick(0.032bps)固定 = MM が張り付き。
 #   touch に並ぶと bid 側の 0.09〜4.5 BTC の後ろに付く(自分は 0.0024 BTC)ので 6秒では刺さらず、

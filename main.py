@@ -913,9 +913,14 @@ class XVenueHedge:
         _ab = self.cfg.get("follow_join_offset_ab") or []
         if _ab:
             joff = int(_ab[self.cycles % len(_ab)])
+            # 台帳に残す腕(途中で touch へ落ちても「割り当て」を記録する)。
+            # ★A/B **稼働中の行だけ**に付けること。固定運用に戻したあとも書き続けると、
+            #   採用した腕だけが増えて他方が凍り、`join_offset_ab` で集計する
+            #   scripts/ab_join_offset.py が**静かに偏る**(A/B 打ち切り後の実害)。
+            joff_used = joff
         else:
             joff = int(self.cfg.get("follow_join_offset_ticks", 0) or 0)
-        joff_used = joff          # 台帳に残す値(途中で touch へ落ちても「割り当て」を記録する)
+            joff_used = None      # A/B 停止中 = 腕の割り当てではない
         while time.time() < hdl:
             if ident is None and not cancel_pending:
                 t_bid, t_ask = self._txflow_bbo()
@@ -1346,18 +1351,21 @@ class XVenueHedge:
             }
         elif ab_leg is not None:
             legs[f"perpl:{self.hedge_leg.symbol}"] = ab_leg
-        return {
+        row = {
             "ts": round(time.time(), 3), "schema": 2, "mode": mode,
             "symbol": self.symbol, "dir_buy": dir_buy, "dry_run": False,
             "size": size, "notional_usd": self.notional,
             "size_lead": size_lead, "lead_notional_usd": round(pp_open_px * size_lead, 4),
             "resid_usd": round(plan["resid_usd"], 4),
-            # ★A/B: この行がどちらの腕か。**この列がある行だけ**で集計すること。
-            "join_offset_ab": joff_used,
             "legs": legs,
             "txflow": tx_mirror, "perpl": pp_mirror,
             "fees_usd": round(fees, 6), "volume_usd": round(volume, 4), "net_usd": round(net, 6),
         }
+        # ★A/B 稼働中の行にだけ腕を書く。固定運用の行に書くと、採用した腕だけが増えて
+        #   他方が凍り、`join_offset_ab` で集計する scripts/ab_join_offset.py が静かに偏る。
+        if joff_used is not None:
+            row["join_offset_ab"] = joff_used
+        return row
 
     def _write_status(self) -> Optional[float]:
         """status.json を書き、効率(net<0のときのみ)を返す。

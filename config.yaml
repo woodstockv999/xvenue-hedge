@@ -100,6 +100,16 @@ taker_cross_bps: 8.0
 # hybrid追従(2026-07-24): perpl裸窓中にtxflow makerを短時間試す→刺されば1.5bps(taker4.5より3bps安)。
 # 刺さらなければtakerで裸窓を閉じる。裸窓が最大try秒に延びる代償でfee削減。
 follow_maker_try_seconds: 6.0    # 案②2026-07-24: open maker試行窓。8sは実測で6sに劣後(taker_follow直近14=43%>直近25=32%・eff5738<6902、n=14ノイズ含むが押し上げ効果なし)→6sへ戻す。厚いtxflow BTC板の追従脚は価格が寄らねばmaker不成立=窓延長は裸窓を延ばすだけで最後taker
+# ★2026-07-28: txflow follow の maker を **板の1tick内側**に置く(0=従来のtouch並び)。
+#   実測: txflow BTC のスプレッドは 15/15 サンプルで常に 2tick(0.032bps)固定 = MM が張り付き。
+#   touch に並ぶと bid 側の 0.09〜4.5 BTC の後ろに付く(自分は 0.0024 BTC)ので 6秒では刺さらず、
+#   **open taker 落ち 47%**(07-24〜28 で 38.8/53.5/64.2/53.8/46.8%、n=990)。
+#   1tick 内側ならスプレッドが 1tick になり、内側に入るには反対 touch を越えるしかない
+#   = **無競争の最良気配**。対向フローに最初に当たる。
+#     コスト 1tick=0.0158bps / 節約 taker回避=3.0bps → **190倍有利**
+#   post_only 拒否時は touch へ落として粘る(いきなり taker にしない)。
+#   ★リスク: キュー先頭は逆選択も最初に受ける。taker率と価格bpsの両方で判定すること。
+follow_join_offset_ticks: 1
 follow_maker_requote_seconds: 1.5  # requote1.0(8500狙い)は棄却(2026-07-24): taker落ちは価格ドリブン(taker群price-$0.026 vs maker-$0.013=adverse-selection検出器・pair_hedge abortと同構造)でタイミングでは消せず、taker率32%→40-48%へ逆に上昇→既知ベスト1.5へ復帰
 # 改善③: perplは共有IPのCF 1015制限=pair_hedgeと帯域競合。poll間隔を空けて429緩和。
 poll_interval_seconds: 5          # fills RESTポーリング間隔。5s=45sリードで最大9回(旧3s=15回)

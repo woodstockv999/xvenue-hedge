@@ -148,6 +148,9 @@ class XVenueHedge:
         _tx_sd = self.tx._symbol_meta[self.symbol.upper()]["size_decimals"]
         # 両会場のsize_decimalsは異なる(HYPE: txflow=1/perpl=2)。粗い方に丸めれば両脚同量=裸デルタ回避。
         self._size_round = min(_tx_sd, int(_m["size_decimals"]))
+        # txflow の価格刻み(follow の join_offset で使う)。price_decimals はクライアント側でキャッシュ。
+        self._px_round = self.tx.price_decimals(self.symbol)
+        self._tx_tick = self.tx.price_tick(self.symbol)
 
         # --- perpl(**脚ごとに1組**。グローバルは持たない。_PerplLeg の docstring 参照) ---
         load_dotenv(Path.home() / "apps" / "hyperliquid-bot" / ".env")
@@ -319,6 +322,29 @@ class XVenueHedge:
         return val
 
     # ================= 実弾: txflow脚(farm) =================
+    def _tx_join_px(self, is_buy: bool, bid: float, ask: float, offset_ticks: int) -> float:
+        """txflow maker の join 価格。offset=0 は touch に並ぶ(従来)。>0 で板の**内側**へ寄せる。
+
+        ## なぜ内側に置くのか(2026-07-28)
+        txflow BTC のスプレッドは実測 **15/15 で常に 2tick(0.032bps)固定**= MM が張り付いている。
+        touch に並ぶと列の最後尾で、bid 側には 0.09〜4.5 BTC が先に並んでいる。自分のサイズは
+        0.0024 BTC なので、その全部が捌けるまで刺さらない → 6秒窓で埋まらず **47% が taker 落ち**。
+        1tick 内側に置くとスプレッドが 1tick になり、**誰も内側に入れない無競争の最良気配**に
+        なる(内側に入るには反対側の touch を越えるしかない)。対向のフローに最初に当たる。
+
+            コスト  1tick = 0.0158bps
+            節約    taker 回避 = 3.0bps(txflow taker 4.5 - maker 1.5)
+            → 190倍 有利
+
+        ★必ず反対側の touch を越えないようクランプする。越えると post_only が拒否され、
+          呼び側は taker に落ちる = 直そうとした当のものを悪化させる。"""
+        if offset_ticks <= 0:
+            return bid if is_buy else ask
+        t, d = self._tx_tick, self._px_round
+        if is_buy:                      # ask-1tick を上限に、bid から内側へ
+            return min(round(bid + offset_ticks * t, d), round(ask - t, d))
+        return max(round(ask - offset_ticks * t, d), round(bid + t, d))
+
     def _tx_place_maker(self, is_buy: bool, price: float, size: float, reduce_only: bool):
         """post_only指値を置き、cloid経由でoidを回収して返す(None=載らず)。
         txflowのplace応答はoidを即返さない前例があるためcloid→openOrdersポーリングで同定
@@ -876,14 +902,22 @@ class XVenueHedge:
         ident, last_place, hdl = None, 0.0, time.time() + htry
         open_idents = []          # このサイクルでopenに使った全ident(取消空振り分の回収用)
         cancel_pending = False    # 取消を送ったが板から消えたことを未確認=**再発注してはいけない**
+        # ★join offset(2026-07-28): 既定で1tick内側に置く(_tx_join_px の docstring 参照)。
+        #   post_only に拒否されたら **その場で touch(offset 0)へ落として粘る** — いきなり
+        #   taker に落とすと、直そうとしている taker 率を自分で上げてしまう。
+        joff = int(self.cfg.get("follow_join_offset_ticks", 0) or 0)
         while time.time() < hdl:
             if ident is None and not cancel_pending:
                 t_bid, t_ask = self._txflow_bbo()
-                mpx = t_bid if tx_is_buy else t_ask     # maker join(buy@bid/sell@ask)
+                mpx = self._tx_join_px(tx_is_buy, t_bid, t_ask, joff)
                 ident = self._tx_place_maker(tx_is_buy, mpx, size, reduce_only=False)
                 last_place = time.time()
-                if ident is None:                        # post_only拒否等→takerへ
-                    break
+                if ident is None:
+                    if joff > 0:                         # 内側が拒否された→touchで置き直す
+                        log(f"txflow open: join+{joff}tick が post_only 拒否 → touch へ落として継続")
+                        joff = 0
+                        continue
+                    break                                # touch でも拒否→takerへ
                 open_idents.append(ident)
             # 約定回収は**現行identだけでなく過去identも**見る(取消が空振りして古い方が刺さる)。
             for cand in reversed(open_idents):
@@ -913,7 +947,9 @@ class XVenueHedge:
                 #   落ちる。perpl lead 側(_perpl_maker_lead)は `if new_px != px:` を持っているのに
                 #   txflow 側の2ループだけ欠落していた。実測 taker落ち 49.6%・損失の70%が手数料。
                 nb_r, na_r = self._txflow_bbo()
-                new_mpx = nb_r if tx_is_buy else na_r
+                # ★join offset 込みで比較する。自分が最良気配になっている間は BBO が自分の値を
+                #   返すので new_mpx == mpx となり、並び直さずキュー先頭を保てる。
+                new_mpx = self._tx_join_px(tx_is_buy, nb_r, na_r, joff)
                 if new_mpx == mpx:
                     last_place = time.time()      # touch 不動 → 並び直さずそのまま待つ
                     time.sleep(0.5)

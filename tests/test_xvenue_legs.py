@@ -472,6 +472,65 @@ def test_hedge_follow_uses_hedge_timeout_not_lead():
     assert seen[0]["timeout_s"] == 120
 
 
+# ------------------------------------------------------- txflow join offset(2026-07-28)
+# ★狙い: txflow open の taker 落ち 47% を、板の1tick内側に置くことで下げる。
+#   クランプを外すと post_only 拒否 → taker 落ちで**悪化する**ので、そこを固定する。
+def _join_bot(off=1, tick=0.1, dec=1):
+    bot = make_bot([make_leg("BTC", 1, 1, 5)])
+    bot._tx_tick, bot._px_round = tick, dec
+    bot.cfg = {"follow_join_offset_ticks": off}
+    return bot
+
+
+def test_join_offset_zero_is_touch():
+    """既定(0)は従来どおり touch に並ぶ = 完全な後方互換。"""
+    b = _join_bot(off=0)
+    assert b._tx_join_px(True, 63191.9, 63192.1, 0) == 63191.9
+    assert b._tx_join_px(False, 63191.9, 63192.1, 0) == 63192.1
+
+
+def test_join_offset_moves_inside_on_two_tick_spread():
+    """実測のスプレッド2tickでは1tick内側に入れる(無競争の最良気配)。"""
+    b = _join_bot()
+    assert b._tx_join_px(True, 63191.9, 63192.1, 1) == pytest.approx(63192.0)
+    assert b._tx_join_px(False, 63191.9, 63192.1, 1) == pytest.approx(63192.0)
+
+
+def test_join_offset_never_crosses_on_one_tick_spread():
+    """★スプレッドが1tickなら内側は無い。touch に留まること(越えると post_only 拒否→taker)。"""
+    b = _join_bot()
+    assert b._tx_join_px(True, 63192.0, 63192.1, 1) == pytest.approx(63192.0)
+    assert b._tx_join_px(False, 63192.0, 63192.1, 1) == pytest.approx(63192.1)
+
+
+def test_join_offset_clamped_when_offset_exceeds_spread():
+    """offset がスプレッドより大きくても反対 touch を越えない。"""
+    b = _join_bot(off=5)
+    buy = b._tx_join_px(True, 63191.9, 63192.1, 5)
+    sell = b._tx_join_px(False, 63191.9, 63192.1, 5)
+    assert buy <= 63192.1 - 0.1 + 1e-9, f"buy が ask を越えた: {buy}"
+    assert sell >= 63191.9 + 0.1 - 1e-9, f"sell が bid を割った: {sell}"
+
+
+def test_join_offset_stable_when_we_are_the_touch():
+    """★自分が最良気配になったら requote しない(キュー先頭を捨てない)。
+
+    BBO は自分の指値を含むので、置いた直後の再読み取りでは bid==自分の価格になる。
+    そこで再計算した join 価格が元と一致することが、requote 抑止の前提。"""
+    b = _join_bot()
+    mpx = b._tx_join_px(True, 63191.9, 63192.1, 1)      # 63192.0 に置く
+    again = b._tx_join_px(True, mpx, 63192.1, 1)        # 板は bid=自分, ask 据え置き
+    assert again == pytest.approx(mpx), "自分が touch なのに置き直そうとしている"
+
+
+def test_join_offset_requotes_when_outbid():
+    """他者に抜かれたら追随する(そこは並び直す必要がある)。"""
+    b = _join_bot()
+    mpx = b._tx_join_px(True, 63191.9, 63192.3, 1)      # 63192.0
+    after = b._tx_join_px(True, 63192.1, 63192.3, 1)    # 誰かが 63192.1 で上乗せ
+    assert after > mpx
+
+
 def test_hedge_follow_noop_without_hedge_leg():
     bot = _hedge_bot()
     bot.hedge_leg = None

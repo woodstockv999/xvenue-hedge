@@ -19,6 +19,15 @@ notional_usd: 150      # ①スケール2026-07-24: 100→150(perpl free$153実�
 #   BTC を使えるセルは実質1つ。pair_hedge を SOL に追いやった結果 効率 8,254→5,242 に落ちていた。
 #   統合すれば両方の役割が BTC の板の上で回る。加えて ETH 脚は**失敗してもサイクルを殺さない**
 #   ので、pair_hedge の損失源だった abort(片脚 46.9%)が設計上消える。
+# ★2026-07-29: txflow 脚を退役。false で txflow に一切発注しない。
+#   経緯: 07-29 02:20 に txflow equity $54.89 < 床$55 で自己ハルト(4.8時間停止)。
+#   txflow は出来高の40%を出しながら**損失の77%**($-83 生涯)を負担しており、
+#   出来高を1.8倍にした結果 16時間で $75.28 → $54.89 まで焼けた。入金しない方針なので退役。
+#   残るのは **perpl BTC + perpl ETH** = 2026-07-22 に効率 **8,978** を出した構成そのもの
+#   (当時の pair_hedge。BTC を xvenue に譲って SOL に落ちてから 3,659 まで劣化していた)。
+#   ★txflow 名目が 0 になると _plan_sizes の残差 = lead 全額 → ETH が lead を丸ごとヘッジする。
+#   ★txflow_min_equity_usd の床も自動で無効化する(発注しない口座の残高で永久ハルトするため)。
+txflow_leg_enabled: false
 hedge_leg_enabled: true    # false で ETH 脚を構築しない=**現行2脚と厳密に等価**(kill switch)
 hedge_symbol: "ETH"        # perpl のヘッジ脚。_PERPL_MARKETS に定義が要る
 # ★カナリア: lead を段階的に上げる。lead == notional_usd のとき残差0=ETH脚が構造的に不在。
@@ -31,8 +40,13 @@ lead_notional_usd: 190
 hedge_ratio: 1.00          # ETH 脚の名目倍率。gross 固定の分散最小比率は 180/300/600s とも
                            # ほぼ 1.0(実測: 0.978/0.987/1.024)。1800s まで伸ばすなら 1.10 へ再校正。
                            # ★pair_hedge の 1.21 は逆回帰の逆数を使った方法論エラーだった。
-perpl_hedge_timeout_seconds: 90   # ETH follow の **maker 試行**の猶予。ここで刺さらなければ taker。
-                           # ★2026-07-28 21:00: 45→90(= hold_seconds)。**サイクル時間はゼロコスト**。
+perpl_hedge_timeout_seconds: 45   # ETH follow の **maker 試行**の猶予。ここで刺さらなければ taker。
+                           # ★2026-07-28 22:55 に 90→45 へ**差し戻し**。90 は「サイクル時間ゼロコスト」
+                           #   だったが**裸窓のコストを数えていなかった**: ETH follow 中は残差 $40 が
+                           #   無ヘッジで、45→90s は露出 1,800 $·秒 の増加(txflow 6→12s の 1,140 より大きい)。
+                           #   実測でも ETH 2.37→1.53bps の節約($0.0062)を上回る価格悪化が出た。
+                           # (以下は 90 にしたときの根拠。棄却済み)
+                           # 旧案 45→90(= hold_seconds): **サイクル時間はゼロコスト**。
                            #   hold_end は ETH follow より先に確定するので、ETH の試行は hold 窓の
                            #   *内側*で走る。90s まで伸ばしても gap は変わらず、減るのは hold 残り
                            #   (=OI)だけ。効率優先の方針なので OI は許容する。
@@ -46,7 +60,28 @@ perpl_hedge_timeout_seconds: 90   # ETH follow の **maker 試行**の猶予。�
                            # 代償: maker 約定率が下がり taker 比率が上がる(t120 で 58%)。1件 $0.023 なので
                            #   全件 taker でも $0.023×18cycle/h×24 = $9.9/日。gap 415→~200s の
                            #   net +2$/h(=+$48/日)に対して十分小さい。
-perpl_hedge_taker_fallback: true  # ★2026-07-28: maker で埋まらなかった残りを taker(6.9bps)で埋め、
+perpl_hedge_taker_fallback_ab: [false, true]
+                           # ★A/B 稼働中(2026-07-29 開始)。空 [] で下の固定値に戻る。
+                           # 経緯: 下の「$190 では taker が高すぎる」という試算で false にしたが、
+                           #   実際に走らせると **ETH が maker で埋まらず 2leg_eth_abort が連発**し、
+                           #   出来高が $765→$383 に半減した。試算が見落としていたのは
+                           #   「maker で粘れば埋まる」ではなく「サイクルが丸ごと消える」こと。
+                           #   abort は手数料は安いが lead $190 を裸で持つ方向賭けになる
+                           #   ([[pair-hedge-loss-anatomy-2026-07-22]] 損失の71%が価格・その71%がabort)。
+                           # 手数料(taker ONが不利)と価格(abortが不利)の綱引きなので机上で決まらない。
+                           #   周回パリティで振って `scripts/ab_hedge_taker.py` で判定する。
+                           # ★判定は効率値そのもの。腕によって1サイクルの出来高が倍違うので、
+                           #   join offset A/B のような「率で判定」は今回は使えない。
+perpl_hedge_taker_fallback: false # ★2026-07-29 に true→false(txflow 退役に連動)。
+                           # 理由: ETH が hedge する対象が **残差$40 → lead 全額$190** に変わった。
+                           #   $40 なら taker 6.9bps = $0.023/cycle で「hold を守る方が得」だったが、
+                           #   $190 では $0.131/cycle になり、**効率が今より落ちる**(試算 5,430 < 現行 6,213)。
+                           # 07-22 に効率 8,978 を出した構成は「両脚 maker・駄目なら見送り」だった。
+                           #   見送りは hold に入らず即クローズするので裸保持は発生しない(安全)。
+                           # ★false でも abort コストは台帳に載る(2026-07-29 に _perpl_hedge_follow を
+                           #   keep_partial=True 固定にして自分で畳むようにした)。true 時代に塞いだ穴を
+                           #   再発させないため。
+                           # 旧: true — ★2026-07-28: maker で埋まらなかった残りを taker(6.9bps)で埋め、
                            # ヘッジ脚を**必ず完成させる**。false で従来動作(不成立なら全畳み)。
                            # 根拠: maker 一本槍だと ETH follow が 40%(49/122)不成立で、その全部が
                            #   hold に入らず即クローズ = 狙っている OI が4割の周回で丸ごと消えていた。
@@ -107,7 +142,17 @@ leg_timeout_seconds: 40          # closeのtxflow maker猶予。15→40(案①20
 taker_cross_bps: 8.0
 # hybrid追従(2026-07-24): perpl裸窓中にtxflow makerを短時間試す→刺されば1.5bps(taker4.5より3bps安)。
 # 刺さらなければtakerで裸窓を閉じる。裸窓が最大try秒に延びる代償でfee削減。
-follow_maker_try_seconds: 12.0   # ★2026-07-28 21:00: 6→12。**手数料の 65.6% が txflow 脚**で、
+follow_maker_try_seconds: 6.0    # ★2026-07-28 22:55 に 12→6 へ**差し戻し**(下の12への変更は棄却)。
+                           #   実測(n=25, 1.5h): 手数料は狙い通り下がった(txflow 2.18→1.95bps・
+                           #   taker 40.8→28.0%)が、**価格損失が -0.0211→-0.0608/cyc と3倍**になり
+                           #   効率 6,213→4,786。節約$0.0108 を価格悪化$0.0397 で買っていた。
+                           # ★構造的な理由(join offset との決定的な違い):
+                           #     join offset  = 「どこに置くか」→ 裸の時間は不変 → 価格はヘッジが相殺 → 無料
+                           #     try/timeout  = 「どれだけ待つか」→ **裸の時間が延びる** → 相殺相手なし → 有料
+                           #   txflow follow 中は perpl $190 が無ヘッジ。待つほど純粋な方向リスクを負う。
+                           #   ★「手数料が下がるなら得」は、裸窓を延ばす施策には適用できない。
+                           # (以下は 12 にしたときの根拠。棄却済みだが再挑戦するなら A/B で)
+                           # 旧案 6→12: **手数料の 65.6% が txflow 脚**で、
                            #   open の 37% が taker(4.5bps)。ここが効率の最大レバー。
                            # ★8s 棄却(下記)を覆す根拠2つ:
                            #   (1) あの判定は **n=14 の前後比較**。txflow の taker 率は時間帯で

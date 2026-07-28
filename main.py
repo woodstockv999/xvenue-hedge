@@ -833,7 +833,20 @@ class XVenueHedge:
             return False, None, 0.0, False, None
         leg = self.hedge_leg
         t = float(self.cfg.get("perpl_hedge_timeout_seconds", 120))
-        use_taker = bool(self.cfg.get("perpl_hedge_taker_fallback", True))
+        # ★A/B(2026-07-29): txflow 退役でヘッジ対象が残差$40→lead全額$190 になり、上の
+        #   「$0.023 だから taker で埋めろ」の前提が崩れた($0.132)。しかし maker 一本槍に
+        #   戻したら **ETH が埋まらず 2leg_eth_abort が連発**した(出来高が半減)。
+        #   abort は手数料こそ安いが lead $190 を裸で持つ方向賭けになる
+        #   ([[pair-hedge-loss-anatomy-2026-07-22]]「損失の71%が価格・その71%がabort由来」)。
+        #   どちらが得かは**手数料と価格の綱引きなので机上では決まらない** → 周回パリティで振る。
+        #   集計は `hedge_taker_ab` 列を持つ行だけ。A/B 停止中は列を書かない(join offset と同規約)。
+        _tab = self.cfg.get("perpl_hedge_taker_fallback_ab") or []
+        if _tab:
+            use_taker = bool(_tab[self.cycles % len(_tab)])
+            self._tk_ab = use_taker
+        else:
+            use_taker = bool(self.cfg.get("perpl_hedge_taker_fallback", True))
+            self._tk_ab = None
         # ★keep_partial は **常に True**(2026-07-29)。use_taker=False のときも部分建玉を
         #   自分で畳んでコストを台帳に持ち帰るため。`_perpl_maker_lead` 内の
         #   `_pp_partial_abort` に任せると unwind の約定を捨ててしまい、2026-07-28 に塞いだ
@@ -936,6 +949,9 @@ class XVenueHedge:
         #   43.4%→68.8% と逆に出たが、投入時刻がもともと 75% の時間帯だった。
         #   **同一時間帯で交互に振る**ことでのみ切り分けられる。集計は `join_offset_ab` 列を持つ
         #   行だけで行うこと([[pair-hedge-ab-null-and-broken-baseline]] と同じ規約)。
+        # ★ヘッジ脚の A/B 腕は毎周回リセットする。`_perpl_hedge_follow` が呼ばれない
+        #   周回(ヘッジ脚無効など)で前周回の腕が残ると、台帳に嘘の割り当てが載る。
+        self._tk_ab = None
         _ab = self.cfg.get("follow_join_offset_ab") or []
         if _ab:
             joff = int(_ab[self.cycles % len(_ab)])
@@ -1402,6 +1418,8 @@ class XVenueHedge:
         #   他方が凍り、`join_offset_ab` で集計する scripts/ab_join_offset.py が静かに偏る。
         if joff_used is not None:
             row["join_offset_ab"] = joff_used
+        if getattr(self, "_tk_ab", None) is not None:
+            row["hedge_taker_ab"] = self._tk_ab
         return row
 
     def _write_status(self) -> Optional[float]:

@@ -786,9 +786,16 @@ class XVenueHedge:
         原因を示すものは 60字で切られたログしか無かった。★口座が痩せると発注が黙って
         拒否されるだけなので、**名目は equity から導け。固定値で書くな**。
 
-        ## 上限の出し方
-        equity ≥ (lead + hedge)/lev で hedge ≈ lead - tx なので
-            lead ≤ (equity × lev × 使用率 + tx) / 2
+        ## 上限の出し方 — **同時に持つ perpl 脚の数で式が変わる**
+        perpl が hold 中に同時に持つのは lead と hedge(≈ lead - tx)。
+
+            ヘッジ脚あり  equity×使用率 ≥ (lead + lead - tx)/lev → lead ≤ (eq×lev×使用率 + tx)/2
+            ヘッジ脚なし  equity×使用率 ≥ lead/lev              → lead ≤  eq×lev×使用率
+
+        ★2脚の式を1脚構成に当てたまま名目を上げると、上限が**半分**のまま張り付いて
+          「上げたのに出来高が増えない」になる。脚の数を変えたら式も変えること
+          ([[xvenue-margin-ceiling-silent-2026-07-29]] と同じ「脚を変えたら証拠金を再計算」)。
+
         使用率は既定 0.75 — 残りは手数料・含み損・マーク変動の緩衝。
         fail-open: equity が読めない/古いときは config の値をそのまま使う
         (読めないことを理由に出来高farmを止めない = equity_floor_reason と同じ方針)。"""
@@ -803,7 +810,8 @@ class XVenueHedge:
         lev = float(self.lead_leg.mcfg.get("leverage", 0) or 0)
         if lev <= 0:
             return lead_notional
-        cap = (eq * lev * util + tx_notional) / 2.0
+        budget = eq * lev * util
+        cap = ((budget + tx_notional) / 2.0) if self.hedge_leg is not None else budget
         if cap >= lead_notional:
             return lead_notional
         if cap != getattr(self, "_last_margin_cap", None):

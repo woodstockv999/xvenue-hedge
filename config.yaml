@@ -60,8 +60,20 @@ perpl_hedge_timeout_seconds: 45   # ETH follow の **maker 試行**の猶予。�
                            # 代償: maker 約定率が下がり taker 比率が上がる(t120 で 58%)。1件 $0.023 なので
                            #   全件 taker でも $0.023×18cycle/h×24 = $9.9/日。gap 415→~200s の
                            #   net +2$/h(=+$48/日)に対して十分小さい。
-perpl_hedge_taker_fallback_ab: [false, true]
-                           # ★A/B 稼働中(2026-07-29 開始)。空 [] で下の固定値に戻る。
+perpl_hedge_taker_fallback_ab: []
+                           # ★A/B 終了(2026-07-29)。maker のみを採用 → 下の固定値 false。
+                           # 結果(片腕 n=12・証拠金天井の区間は除外):
+                           #     abort(maker のみ) 効率 14,000  出来高 $281/cycle  両建てなし
+                           #     3leg_taker        効率  3,488  出来高 $561/cycle  両建てあり
+                           #   手数料の差 $0.097/cycle は**決定論的**なので n を積んでも順位は動かない
+                           #   (perpl taker 6.9bps + スプレッド跨ぎ)。
+                           # ★「裸窓が危ないのでは」への答え: abort が taker に並ぶには裸価格コストが
+                           #   **4.75 bps/cycle** 必要。実測 0.835 bps(n=27, 95%CI [-2.04, +0.37])で
+                           #   分岐点まで 5.7倍の余裕。相場付き(レンジ/トレンド)では判断が反転しない
+                           #   ので regime ゲートは作らない([[regime-turn-undetectable-2026-07-22]])。
+                           # ★将来ゲートするなら予測でなく**実測した裸コストのローリング平均**で。
+                           #   閾値は上記の 4.75 bps。
+                           # 空 [] で下の固定値に戻る。再開するなら [false, true]。
                            # 経緯: 下の「$190 では taker が高すぎる」という試算で false にしたが、
                            #   実際に走らせると **ETH が maker で埋まらず 2leg_eth_abort が連発**し、
                            #   出来高が $765→$383 に半減した。試算が見落としていたのは

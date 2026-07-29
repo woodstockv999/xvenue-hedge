@@ -76,6 +76,8 @@ PerplClient = _pc.PerplClient
 PerplMarketData = _pe.PerplMarketData
 PerplExecutor = _pe.PerplExecutor
 
+from vol_guard import VolGuard          # noqa: E402  ボラ・テールの片側kill-switch(案A)
+
 CYCLES_PATH = APP / "data" / "cycles.jsonl"
 STATUS_PATH = APP / "data" / "status.json"
 
@@ -182,6 +184,12 @@ class XVenueHedge:
         #   account ストリームは全market横断で getter が market_id フィルタ済み＝共有して正しい。
         self.pp_account = self.pp_client.shared_account_feed()
         self.pp_account.start()
+
+        # --- ボラ・テールの片側kill-switch(2026-07-29 案A。vol_guard.py の docstring 参照) ---
+        # 測るのは **lead 脚**の板。裸で持つのがこの脚だから。
+        # 既定は shadow(enabled:false)= 判定とログだけ出して止めない。実測を見てから実発火へ。
+        self.vol_guard = VolGuard(self.pp_client, self.lead_leg.market_id,
+                                  cfg.get("vol_guard", {}), logger=log)
 
         # --- 台帳(累積) ---
         self.cum_volume = 0.0
@@ -627,7 +635,7 @@ class XVenueHedge:
                         log(f"⚠️ {leg.name} 指値を置けなかった(size={size} px={px}) "
                             f"→ {plt:.0f}s まで再試行。連続するなら証拠金/サイズ上限を疑う")
                         place_fail_logged = True
-                        # ★失敗が続くときだけ口座を1回읽む。2026-07-29 はここが見えず、
+                        # ★失敗が続くときだけ口座を1回読む。2026-07-29 はここが見えず、
                         #   「余力 $66.26 vs 必要 $66.67」を突き止めるのに11時間かかった。
                         #   失敗時限定なので通常運転では叩かない(429を作らない)。
                         self._log_margin_state(leg, size, px)
@@ -1691,6 +1699,9 @@ class XVenueHedge:
             # txflow 口座残高(2026-07-27追加)。60秒キャッシュ経由なので status を書く頻度で
             # API を叩くことはない。外側の監視がこの1点だけで証拠金枯渇を見られるようにする。
             "txflow_equity_usd": (None if self.dry_run else self._tx_equity()),
+            # ボラ・テール判定(案A)。shadow 中も **必ず載せる** — 「発火していたはず」が
+            # 後から数えられないと、実発火へ切り替える判断ができない。副作用なしの最終評価。
+            "vol_guard": self.vol_guard.snapshot(),
         }, indent=2))
         return eff
 
@@ -1762,10 +1773,13 @@ class XVenueHedge:
         出来高farmを続ける方針なので効率ゲートは無効化し(config efficiency_floor: 0)、
         口座の生存だけを合算ガードで守る。
 
-        ## 残る3段
+        ## 残る3段 + ボラ・テール(2026-07-29 案A)
         1. 合算ローリングガード(account_guard_24h_usd) … 口座を守る主役
         2. loss_budget_usd(セル累積) … バグ暴走用の外側の弁
         3. efficiency_floor … 既定0=無効。効率で止めたくなったら戻す口を残す
+        4. vol_guard … 1脚化で残った唯一の構造リスク(裸秒の価格損)の片側停止。
+           既定は shadow。上の3段が**事後**(損が出てから止まる)なのに対し、
+           これだけが**事前**(損が出る条件で止める)。方向は賭けない。
         """
         # 1. 口座レベル: 両セルの直近24h合算損失。全期間累積は既に -$144 で閾値を置けないため窓で見る。
         guard = _pag.halt_reason(float(self.cfg.get("account_guard_24h_usd", 0) or 0),
@@ -1787,6 +1801,15 @@ class XVenueHedge:
         if self.cum_net <= -float(self.cfg["loss_budget_usd"]):
             return (f"loss_budget${self.cfg['loss_budget_usd']}超過"
                     f"(net=${self.cum_net:.3f})")
+        # 4. ボラ・テール(案A)。shadow のときは常に None が返る=判定とログだけ走る。
+        #    ★例外は必ず握る。ここで落ちると farm 全体が止まる=fail-open の趣旨に反する。
+        try:
+            vol_reason = self.vol_guard.halt_reason()
+        except Exception as e:
+            log(f"vol_guard 例外につき通過(fail-open): {type(e).__name__}: {e}")
+            vol_reason = None
+        if vol_reason:
+            return vol_reason
         floor = float(self.cfg.get("efficiency_floor", 0) or 0)
         if floor <= 0 or self.cum_net >= 0:
             return None

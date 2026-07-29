@@ -23,11 +23,15 @@
 効率= 出来高 ÷ |net| (net<0のとき)。net≥0(黒字)は損失ゼロ=効率無限大として出来高/手数料を参考表示。
 """
 import json
+import sys
 from pathlib import Path
 
 import yaml
 
 HOME = Path.home()
+sys.path.insert(0, str(HOME / "apps" / "hyperliquid-bot"))
+from src import xvenue_ledger as _shim  # noqa: E402  台帳 v1/v2 の差を吸収するシム
+
 PAIR_HEDGE_CYCLES = HOME / "apps" / "hyperliquid-bot" / "shared" / "pair_hedge_cycles.jsonl"
 XVENUE_CYCLES = HOME / "apps" / "xvenue-hedge" / "data" / "cycles.jsonl"
 XVENUE_CONFIG = HOME / "apps" / "xvenue-hedge" / "config.yaml"
@@ -53,8 +57,10 @@ def _read(path: Path, keep=lambda r: True) -> list[dict]:
 def _acc(rows, vol_key="volume_usd", net_key="net_usd") -> dict:
     """出来高・netを合算。net_keyは戦略で違う(xvenue/pair_hedge=net_usd, txflow-bot=net_pnl_usd)。
 
-    ★`skip_reason` を持つ行は**中断サイクルのコスト計上**(2026-07-27 D-5)。出来高0・
-    net=-手数料 なので損失には数えるが、**サイクル数には数えない**(完走ではないため)。"""
+    ★`skip_reason` を持つ行は**中断サイクルのコスト計上**(2026-07-27 D-5)。損失には数えるが、
+    **サイクル数には数えない**(完走ではないため)。
+    ★2026-07-29 から中断行も**出来高を持ちうる**(lead が部分約定して畳んだ往復)。
+      「中断行は出来高0」を前提にした分岐を書かないこと。"""
     vol = sum(r.get(vol_key, 0) for r in rows)
     net = sum(r.get(net_key, 0) for r in rows)
     fees = sum(r.get("fees_usd", r.get("fee_usd", 0)) for r in rows)
@@ -63,6 +69,37 @@ def _acc(rows, vol_key="volume_usd", net_key="net_usd") -> dict:
 
 
 def _xvenue_by_venue(rows) -> dict:
+    """会場別。**脚は src.xvenue_ledger のシムで正規化する**(2026-07-27)。
+    v1(2脚)と v2(`legs` 明示・3脚まで)が台帳に混在するため、ここで形の差を吸収する。
+    ★旧実装の「fees_usd から perpl 分を引いた残りが txflow 脚」という残差方式は、
+      perpl 脚が2本になると破綻する(ETH の手数料が txflow に付け替わる)ので廃止。"""
+    out = {"perpl": {"volume": 0.0, "net": 0.0, "n": 0},
+           "txflow": {"volume": 0.0, "net": 0.0, "n": 0}}
+    for r in rows:
+        legs = _shim.iter_legs(r)
+        if not legs:
+            # 中断コスト行(D-5)は脚に分解できない。★ただし 2026-07-29 から
+            # **出来高を持ちうる**(lead の部分約定→畳み = 実際に建てて実際に畳んだ往復)。
+            # 中断は必ず perpl lead 脚なので perpl に寄せる。捨てると会場別が戦略別より
+            # 小さく出て、差分の出どころが分からなくなる。
+            if r.get("skip_reason"):
+                out["perpl"]["volume"] += r.get("volume_usd", 0.0)
+                out["perpl"]["net"] += r.get("net_usd", 0.0)
+            continue
+        seen = set()
+        for lg in legs:
+            v = lg.get("venue")
+            if v not in out:
+                continue
+            out[v]["volume"] += _shim.leg_volume(lg)
+            out[v]["net"] += _shim.leg_net(lg)
+            if v not in seen:             # 1サイクルは会場ごとに1カウント
+                out[v]["n"] += 1
+                seen.add(v)
+    return out
+
+
+def _xvenue_by_venue_legacy(rows) -> dict:
     """xvenueの各サイクルを会場別に【脚別実額】で分解(2026-07-24修正、旧50/50按分を廃止)。
     - perpl脚net = perpl価格PnL - perpl脚fee(taker_hedgeなら6.9・通常maker0.9 + close無料)
     - txflow脚net = txflow価格PnL - txflow脚fee(=記録fees_usd - perpl脚fee)
@@ -75,8 +112,14 @@ def _xvenue_by_venue(rows) -> dict:
     perpl = {"volume": 0.0, "net": 0.0, "n": 0}
     txflow = {"volume": 0.0, "net": 0.0, "n": 0}
     for r in rows:
-        if r.get("skip_reason"):   # 中断コスト行(D-5)は脚別に分解できない(出来高0)→会場別から除外。
-            continue               # 戦略別(_acc)には含まれるので、会場別の合計とは差が出る。
+        if r.get("skip_reason"):
+            # ★中断行は 2026-07-29 から **出来高を持ちうる**(lead の部分約定→畳み。
+            #   実際に建てて実際に畳んだ往復なので会場から見れば出来高)。旧コメントの
+            #   「出来高0だから除外」はもう成立しない。中断は必ず perpl lead 脚なので
+            #   perpl に寄せる。ここで捨てると会場別が戦略別より小さく出る。
+            perpl["volume"] += r.get("volume_usd", 0.0)
+            perpl["net"] += r.get("net_usd", 0.0)
+            continue
         n = r.get("notional_usd", 0)
         pp = r.get("perpl", {}) or {}
         tx = r.get("txflow", {}) or {}
@@ -92,16 +135,26 @@ def _xvenue_by_venue(rows) -> dict:
 
 
 def _xvenue_by_symbol(rows) -> dict:
-    """xvenueは1サイクル1銘柄。symbol でそのまま分ける(2026-07-25以前の行はBTC後付け済み)。"""
+    """銘柄別。**脚ベース**で分ける(2026-07-27)。
+
+    旧実装は行の `symbol` で分けていたが、3脚化すると1サイクルが BTC(lead+txflow)と
+    ETH(hedge)の**両方に寄与する**ので行単位では分けられない。脚別に実 net/fee を
+    持つようになったため按分も不要(pair_hedge 側の按分より正確)。"""
     out = {}
     for r in rows:
-        if r.get("skip_reason"):   # 中断コスト行(D-5)は完走ではない→銘柄別からは除外
+        legs = _shim.iter_legs(r)
+        if not legs:               # 中断コスト行(D-5)は完走ではない→銘柄別からは除外
             continue
-        a = out.setdefault(r.get("symbol", "BTC"), {"n": 0, "volume": 0.0, "net": 0.0, "fees": 0.0})
-        a["n"] += 1
-        a["volume"] += r.get("volume_usd", 0.0)
-        a["net"] += r.get("net_usd", 0.0)
-        a["fees"] += r.get("fees_usd", 0.0)
+        seen = set()
+        for lg in legs:
+            sym = lg.get("symbol") or "BTC"
+            a = out.setdefault(sym, {"n": 0, "volume": 0.0, "net": 0.0, "fees": 0.0})
+            a["volume"] += _shim.leg_volume(lg)
+            a["net"] += _shim.leg_net(lg)
+            a["fees"] += float(lg.get("fees_usd") or 0.0)
+            if sym not in seen:    # 1サイクルは銘柄ごとに1カウント
+                a["n"] += 1
+                seen.add(sym)
     return out
 
 

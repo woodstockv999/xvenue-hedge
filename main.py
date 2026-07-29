@@ -552,6 +552,35 @@ class XVenueHedge:
         self.dirty = True  # 畳めたか確認できていない→次ループ先頭で両会場flatを確認する
         return r
 
+    def _stash_lead_abort(self, open_px: float, sz: float, is_buy: bool, unwind: Optional[dict]) -> None:
+        """lead の部分約定→畳みを**台帳に持ち帰るために self に積む**(2026-07-29)。
+
+        ★これが無いと、部分約定した往復は open の maker 手数料も価格差も**台帳に1行も
+          残らない**(見送りは行を書かないため)。2026-07-28 に ETH ヘッジ脚で塞いだ
+          「unwind の戻り値を捨てるとコストがブラックホールになる」と**完全に同じ穴**が
+          lead 側に残っていた([[xvenue-eff9000-is-txflow-dilution-2026-07-28]])。
+          実測(1脚期3時間): 7件・建てた名目 $339 = 出来高 $678 が不可視だった。
+
+        ★戻り値のタプル(filled, px, got_sz)を増やして運ばないのは、あの契約を変えると
+          呼び側が黙って壊れるため(test_maker_lead_returns_three_tuple)。self に置いて
+          `_run_cycle_live` の見送りパスで回収する。"""
+        if sz <= 1e-8 or not open_px:
+            return
+        notional = float(open_px) * float(sz)
+        fee = notional * self.fees["perpl_maker_bps"] / 1e4      # close は無料 taker
+        pnl = 0.0
+        if isinstance(unwind, dict):
+            cpx = float(unwind.get("price") or unwind.get("px") or 0.0)
+            if cpx > 0:
+                # is_buy=True で建てた=ロング。畳みは売り。
+                pnl = (cpx - open_px) * sz if is_buy else (open_px - cpx) * sz
+                notional += cpx * sz                              # 出来高は open+close
+            else:
+                notional *= 2                                     # close 価格不明=open で近似
+        else:
+            notional *= 2
+        self._lead_abort = {"volume_usd": notional, "fees_usd": fee, "pnl": pnl}
+
     def _perpl_maker_lead(self, leg: "_PerplLeg", is_buy: bool, size: float,
                           timeout_s: Optional[float] = None, keep_partial: bool = False):
         """改善①②: perpl maker を先行させ requote しながら perpl_lead_timeout まで刺しにいく。
@@ -605,7 +634,8 @@ class XVenueHedge:
                         self._pp_cancel_verified(leg, oid)
                         return False, px, fsz
                     log(f"{leg.name} lead 部分約定のまま {fsz}/{size} → 残restingを取消し畳んで見送り")
-                    self._pp_partial_abort(leg, oid, is_buy, fsz)
+                    self._stash_lead_abort(px, fsz, is_buy,
+                                           self._pp_partial_abort(leg, oid, is_buy, fsz))
                     return False, None, 0.0
             if time.time() - last_place >= rq:       # requote: touchが動いてたら置き直す
                 szi = abs(self._pp_szi(leg))
@@ -643,7 +673,7 @@ class XVenueHedge:
                 log(f"{leg.name} timeout時に部分建玉 {szi}/{size} → 建玉は残して呼び側へ返す")
                 return False, px, szi
             log(f"{leg.name} lead timeout時に部分建玉 {szi}/{size} → 畳んで見送り")
-            self._perpl_unwind(leg, is_buy, szi)
+            self._stash_lead_abort(px, szi, is_buy, self._perpl_unwind(leg, is_buy, szi))
             self.dirty = True
         return False, None, 0.0
 
@@ -985,6 +1015,12 @@ class XVenueHedge:
             _lab = getattr(self, "_ln_ab", None)
             if _lab is not None:
                 log(f"cycle見送り(ab=${_lab:.0f} arms={getattr(self, '_ln_ab_arms', '')})")
+            # ★部分約定→畳みが起きていたら、その往復のコストと出来高を持ち帰る。
+            #   捨てると台帳にも account_guard にも1ドルも出ない(見送りは行を書かない)。
+            ab = getattr(self, "_lead_abort", None)
+            self._lead_abort = None
+            if ab:
+                return {"skip": "perpl_lead_partial_unwound", **ab}
             return {"skip": "perpl_lead_no_fill"}   # 建玉なし=安全に見送り
 
         # perpl約定=裸perpl。txflow FOLLOWSでヘッジ。【hybrid: 短時間maker試行→taker】(2026-07-24)。
@@ -1534,8 +1570,14 @@ class XVenueHedge:
         }, indent=2))
         return eff
 
-    def _record_abort(self, reason: str, fees: float) -> None:
-        """中断サイクルのコストを台帳に残す(2026-07-27 D-5)。出来高0・net=-手数料。
+    def _record_abort(self, reason: str, fees: float,
+                      volume: float = 0.0, pnl: float = 0.0) -> None:
+        """中断サイクルのコストを台帳に残す(2026-07-27 D-5)。net = pnl - 手数料。
+
+        ★volume/pnl は **lead が部分約定して畳んだ**ときに渡す(2026-07-29)。あれは
+          「発注しただけ」ではなく**実際に建てて実際に畳んだ往復**なので、会場から見れば
+          出来高であり、価格差も現実に出ている。volume=0 固定のままだと出来高を過小、
+          効率を過大に見積もる。
 
         旧コードは見送り/中断を台帳に一切書かず、unwind の taker 手数料が cum_net に入って
         いなかった(実測 10時間窓で $0.151 = 損失の1.3%)。account_guard_24h_usd も同じ台帳を
@@ -1543,14 +1585,16 @@ class XVenueHedge:
         ★`skip_reason` を持つ行は完走サイクルではない。集計側は cycles に数えないこと
         (_load_ledger と scripts/efficiency.py で除外済み)。"""
         rec = {"ts": round(time.time(), 3), "symbol": self.symbol, "dry_run": self.dry_run,
-               "skip_reason": reason, "volume_usd": 0.0,
-               "fees_usd": round(fees, 6), "net_usd": round(-fees, 6)}
+               "skip_reason": reason, "volume_usd": round(volume, 4),
+               "fees_usd": round(fees, 6), "net_usd": round(pnl - fees, 6)}
         with CYCLES_PATH.open("a") as f:
             f.write(json.dumps(rec, separators=(",", ":")) + "\n")
         self.cum_net += rec["net_usd"]
         self.cum_fees += rec["fees_usd"]
+        self.cum_volume += rec["volume_usd"]
         self._write_status()
-        log(f"中断コスト計上: {reason} fees=${fees:.4f} cum_net=${self.cum_net:+.3f}")
+        log(f"中断コスト計上: {reason} vol=${volume:.0f} fees=${fees:.4f} "
+            f"net=${rec['net_usd']:+.4f} cum_net=${self.cum_net:+.3f}")
 
     def _notify_halt_cleared(self) -> None:
         """自己ハルト**解除**を Discord へ1回だけ通知(状態遷移時のみ)。fail-open。"""
@@ -1696,6 +1740,12 @@ class XVenueHedge:
                     # 中断コスト(unwind の taker 手数料等)があれば台帳に残す(2026-07-27 D-5)
                     if rec.get("abort_fees_usd"):
                         self._record_abort(rec["skip"], float(rec["abort_fees_usd"]))
+                    # lead の部分約定→畳み。**実際に建てて実際に畳んだ往復**なので
+                    # 出来高も価格差も現実に出ている(2026-07-29)。
+                    elif rec.get("fees_usd") or rec.get("volume_usd"):
+                        self._record_abort(rec["skip"], float(rec.get("fees_usd") or 0.0),
+                                           volume=float(rec.get("volume_usd") or 0.0),
+                                           pnl=float(rec.get("pnl") or 0.0))
                     # ★見送り時にperplへ想定外建玉(cancel-fillレースの残脚。2026-07-24 HYPEで多発)が
                     #   あればガードがskipし続けて停止+脚放置になる。常駐AccountFeed(WS・429負荷ほぼ無)で
                     #   検出したらdirtyを立て次ループで両会場flat化=停止と裸脚を自己修復する。

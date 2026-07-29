@@ -24,6 +24,7 @@ txflowでBTCをmaker farm(将来pt)しつつ、perplで逆BTCをヘッジ=デル
 import importlib.util
 import json
 import os
+import random
 import subprocess
 import sys
 import time
@@ -187,6 +188,10 @@ class XVenueHedge:
         self.cum_net = 0.0
         self.cum_fees = 0.0
         self.cycles = 0
+        # A/B の腕を振る RNG。★決定論的な割り当ては「気づいていない周期」と同期しうる
+        #   (2026-07-29: attempts%2 で振ったら dir_buy と交絡して約定率が逆に出た)。
+        #   テストから差し替えられるよう属性で持つ。
+        self._rng = random.Random()
         self.halted = False
         self.halted_reason = ""
         self.dirty = False  # cycle例外後の未フラット疑い。両会場flat確認まで新規サイクルを止める
@@ -889,7 +894,10 @@ class XVenueHedge:
             # ★腕の組も残す(2026-07-29)。腕を差し替えた前後の行を混ぜると、**残した腕にだけ
             #   相手不在の時間の行が乗る**(実際 [170,230]→[170,200] で $170 が該当した)。
             #   集計は「最新の組の行だけ」を使う。
-            self._ln_ab_arms = "/".join(f"{float(a):.0f}" for a in _lab)
+            # ★タグに**割り当て方式**も入れる(2026-07-29)。腕の組が同じでも方式が変われば
+            #   前の窓のデータは使えない(交互→乱択で dir_buy との交絡が消えたため)。
+            #   組だけをタグにしていると、交絡済みの行が静かに混ざる。
+            self._ln_ab_arms = "/".join(f"{float(a):.0f}" for a in _lab) + "@rnd"
         else:
             lead_notional = float(self.cfg.get("lead_notional_usd", tx_notional) or tx_notional)
             self._ln_ab = None                   # A/B 停止中 = 腕の割り当てではない
@@ -1017,6 +1025,10 @@ class XVenueHedge:
         # === OPEN: perpl maker LEAD(patient+requote) ===
         perpl_is_buy = not dir_buy
         pp_filled, pp_open_px, _ = self._perpl_maker_lead(self.lead_leg, perpl_is_buy, size_lead)
+        # ★建玉が立った時刻を残す(2026-07-29)。台帳は `ts`(サイクル終了)しか持っておらず、
+        #   保有時間を出すのに毎回 perpl の fills を叩く必要があった(=429 の種)。
+        #   約定検知の時刻なので実約定とは poll 間隔ぶんズレるが、秒オーダーの比較には足りる。
+        pp_open_ts = time.time()
         if not pp_filled:
             # ★見送り行にも腕を残す。約定率は 完走/(完走+見送り) なので、**見送りを腕別に
             #   数えられないと分母が作れない**(台帳には完走しか載らない)。
@@ -1271,7 +1283,21 @@ class XVenueHedge:
         # ★hold タイマーを**ここより先に**確定させる。ETH follow は中央値50秒かかるので、
         #   これを hold の外に置くと1サイクルが 6分→7.5分に伸びて throughput が -20%。
         #   ETH は hold 時間の内側で刺しにいく。
-        hold_end = time.time() + float(self.cfg["hold_seconds"])
+        # ★hold A/B(2026-07-29)。「maker で約定した=価格が自分の逆へ動いた瞬間」なので、
+        #   その不利が**戻るのか続くのか**で最適な保有時間が決まる。現在の価格コスト
+        #   -0.28〜-1.38bps は保有 6秒(実測 中央値)時点の markout でしかない。
+        #   ★これは「発注を待つ」のではなく「**建った建玉をいつ閉じるか**」なので、
+        #     07-28 に効率を落とした follow_maker_try 延長とは性質が違う(裸窓は増えるが
+        #     それは待ち時間そのもので、約定を待つ空振り時間ではない)。
+        #   ★腕は乱択。決定論だと dir_buy(完走時にしか反転しない)と交絡する。
+        _hab = self.cfg.get("hold_seconds_ab") or []
+        if _hab:
+            hold_s = float(self._rng.choice(_hab))
+            self._hold_ab = hold_s
+        else:
+            hold_s = float(self.cfg["hold_seconds"])
+            self._hold_ab = None
+        hold_end = time.time() + hold_s
         eth_is_buy = not perpl_is_buy      # lead の残差(lead-txflow)を打ち消す向き
         size_eth = float(plan["size_eth"])
         eth_filled, eth_open_px, mode = False, None, "2leg"
@@ -1548,6 +1574,12 @@ class XVenueHedge:
         if getattr(self, "_ln_ab", None) is not None:
             row["lead_notional_ab"] = self._ln_ab
             row["lead_notional_ab_arms"] = getattr(self, "_ln_ab_arms", "")
+        if getattr(self, "_hold_ab", None) is not None:
+            row["hold_seconds_ab"] = self._hold_ab
+        # 実保有秒。**指定した hold ではなく実測**を残す(close の約定にも時間がかかるので、
+        # hold 0 でも実際は中央値6秒。指定値で markout を語ると系統的にズレる)。
+        row["open_ts"] = round(pp_open_ts, 3)
+        row["hold_actual_s"] = round(row["ts"] - pp_open_ts, 2)
         return row
 
     def _write_status(self) -> Optional[float]:

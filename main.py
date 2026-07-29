@@ -848,6 +848,10 @@ class XVenueHedge:
         if _lab:
             lead_notional = float(_lab[self.attempts % len(_lab)])
             self._ln_ab = lead_notional
+            # ★腕の組も残す(2026-07-29)。腕を差し替えた前後の行を混ぜると、**残した腕にだけ
+            #   相手不在の時間の行が乗る**(実際 [170,230]→[170,200] で $170 が該当した)。
+            #   集計は「最新の組の行だけ」を使う。
+            self._ln_ab_arms = "/".join(f"{float(a):.0f}" for a in _lab)
         else:
             lead_notional = float(self.cfg.get("lead_notional_usd", tx_notional) or tx_notional)
             self._ln_ab = None                   # A/B 停止中 = 腕の割り当てではない
@@ -980,7 +984,7 @@ class XVenueHedge:
             #   数えられないと分母が作れない**(台帳には完走しか載らない)。
             _lab = getattr(self, "_ln_ab", None)
             if _lab is not None:
-                log(f"cycle見送り(ab=${_lab:.0f})")
+                log(f"cycle見送り(ab=${_lab:.0f} arms={getattr(self, '_ln_ab_arms', '')})")
             return {"skip": "perpl_lead_no_fill"}   # 建玉なし=安全に見送り
 
         # perpl約定=裸perpl。txflow FOLLOWSでヘッジ。【hybrid: 短時間maker試行→taker】(2026-07-24)。
@@ -1499,6 +1503,7 @@ class XVenueHedge:
             row["hedge_taker_ab"] = self._tk_ab
         if getattr(self, "_ln_ab", None) is not None:
             row["lead_notional_ab"] = self._ln_ab
+            row["lead_notional_ab_arms"] = getattr(self, "_ln_ab_arms", "")
         return row
 
     def _write_status(self) -> Optional[float]:

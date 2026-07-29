@@ -33,7 +33,7 @@ from pathlib import Path
 APP = Path(__file__).resolve().parent.parent
 CYCLES = APP / "data" / "cycles.jsonl"
 LOG = Path.home() / ".pm2" / "logs" / "xvenue-hedge-out.log"
-_SKIP_RE = re.compile(r"cycle見送り\(ab=\$(\d+)\)")
+_SKIP_RE = re.compile(r"cycle見送り\(ab=\$(\d+) arms=([0-9/]*)\)")
 
 
 def load_rows(hours: float | None) -> list[dict]:
@@ -49,6 +49,11 @@ def load_rows(hours: float | None) -> list[dict]:
         if r.get("dry_run") or "lead_notional_ab" not in r:
             continue
         rows.append(r)
+    # ★最新の「腕の組」の行だけ使う。腕を差し替えた前後を混ぜると、残した腕にだけ
+    #   相手不在の時間の行が乗って静かに有利になる([170,230]→[170,200] で実際に発生)。
+    if rows:
+        latest = rows[-1].get("lead_notional_ab_arms", "")
+        rows = [r for r in rows if r.get("lead_notional_ab_arms", "") == latest]
     if hours and rows:
         newest = max(r["ts"] for r in rows)
         rows = [r for r in rows if r["ts"] >= newest - hours * 3600]

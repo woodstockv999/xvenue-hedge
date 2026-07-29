@@ -876,7 +876,15 @@ class XVenueHedge:
         #   ★腕は `self.attempts`(見送り込み)で振る。`self.cycles` で振ると偏る(上の注記参照)。
         _lab = self.cfg.get("lead_notional_ab") or []
         if _lab:
-            lead_notional = float(_lab[self.attempts % len(_lab)])
+            # ★**乱択で振る**(2026-07-29 に決定論を捨てた)。当初 attempts % len で交互に
+            #   振ったところ、方向と交絡した:
+            #       $170 → perpl SELL 72% / $200 → perpl SELL 37%
+            #   腕は**試行ごと**に交代するのに `dir_buy` は**完走時にだけ**反転するので、
+            #   進み方の違う2つのカウンタが相関した。トレンド中は板の片側だけよく埋まるため、
+            #   これは約定率に直撃する(実際 $170 41% vs $200 64% と、前の窓と逆に出た)。
+            #   決定論的な割り当ては「自分が気づいていない周期」と必ず同期しうる。
+            #   乱択なら未知の周期に対しても直交する。
+            lead_notional = float(self._rng.choice(_lab))
             self._ln_ab = lead_notional
             # ★腕の組も残す(2026-07-29)。腕を差し替えた前後の行を混ぜると、**残した腕にだけ
             #   相手不在の時間の行が乗る**(実際 [170,230]→[170,200] で $170 が該当した)。

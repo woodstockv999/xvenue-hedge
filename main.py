@@ -607,6 +607,7 @@ class XVenueHedge:
         since_ms = int(time.time() * 1000)
         deadline = time.time() + plt
         oid, px, last_place, partial_since = None, None, 0.0, 0.0
+        place_fail_logged = False        # 発注失敗ログは1試行につき1本だけ
         while time.time() < deadline:
             if oid is None:
                 if self._pp_entry_blocked(leg):      # 常駐WSで先に見切る(handshakeを焼かない)
@@ -616,6 +617,16 @@ class XVenueHedge:
                 oid = leg.exec.place_maker_resting(is_buy, size, px, reduce_only=False)
                 last_place, partial_since = time.time(), 0.0
                 if oid is None:
+                    # ★黙って再試行しないこと(2026-07-29)。ここは「発注できなかった」経路で、
+                    #   ログが一切無かったため **サイズ $245 が 0/35 という結果だけが見え、
+                    #   板が薄いのか発注が拒否されているのか区別できなかった**。
+                    #   部分約定すら出ない 0% は板の厚みでは説明できない = 指値が乗っていない。
+                    #   今朝の sr=44(証拠金不足で全拒否・症状は出来高半減だけ)と同型の盲点。
+                    #   毎ループ出すと煩いので、1回の試行につき最初の1本だけ出す。
+                    if not place_fail_logged:
+                        log(f"⚠️ {leg.name} 指値を置けなかった(size={size} px={px}) "
+                            f"→ {plt:.0f}s まで再試行。連続するなら証拠金/サイズ上限を疑う")
+                        place_fail_logged = True
                     time.sleep(poll)
                     continue
             # 約定検知は常駐口座WS(handshake不要)を主に。取れない/古いときだけ従来の

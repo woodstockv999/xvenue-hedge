@@ -839,7 +839,18 @@ class XVenueHedge:
         #   効率 8,978 を出した構成そのもの。txflow 名目を 0 にすると残差 = lead 全額となり、
         #   ETH が lead を丸ごとヘッジする(下の resid_sz 計算がそのまま成立する)。
         tx_notional = float(self.notional) if self.cfg.get("txflow_leg_enabled", True) else 0.0
-        lead_notional = float(self.cfg.get("lead_notional_usd", tx_notional) or tx_notional)
+        # ★サイズ A/B(2026-07-29)。$139(2脚)→$200(1脚) で lead 約定率が 57%→32% に落ちた。
+        #   サイズを上げるほど出来高が増えるという前提が成立していない = **最適サイズが
+        #   現行の内側にある可能性**がある。ただし $139 と $200 は構造(ETH脚の有無)も違うので
+        #   弾性の推定に使えない。同一構造・同一時間帯で並走させないと最適点は出ない。
+        #   ★腕は `self.attempts`(見送り込み)で振る。`self.cycles` で振ると偏る(上の注記参照)。
+        _lab = self.cfg.get("lead_notional_ab") or []
+        if _lab:
+            lead_notional = float(_lab[self.attempts % len(_lab)])
+            self._ln_ab = lead_notional
+        else:
+            lead_notional = float(self.cfg.get("lead_notional_usd", tx_notional) or tx_notional)
+            self._ln_ab = None                   # A/B 停止中 = 腕の割り当てではない
         if lead_notional < tx_notional:
             lead_notional = tx_notional          # lead < txflow は設計外(残差が負になる)
         lead_notional = self._margin_cap(lead_notional, tx_notional)
@@ -949,6 +960,11 @@ class XVenueHedge:
           txflow follow は ~8秒 / perpl ETH follow は中央値50秒でレイテンシが桁違いなので
           並行化しても全体の6%しか縮まらず、perpl のトークンバケットが実質の直列化装置になる。
           ETH が不成立なら **全畳み**(3脚とも即クローズ)。hold には入らない。"""
+        # ★試行カウンタ(2026-07-29)。A/B の腕は **`self.cycles` で振ってはいけない** —
+        #   あれは完走したサイクルしか加算しないので、約定しにくい腕ほど同じ腕を連続で
+        #   引き続け、試行回数が腕間で偏る(サイズ A/B では「大きい腕ほど試行が増える」)。
+        #   見送りも含めて数える別カウンタで振ること。
+        self.attempts = getattr(self, "attempts", 0) + 1
         lt = float(self.cfg["leg_timeout_seconds"])
         poll = float(self.cfg["poll_interval_seconds"])
         t_bid, t_ask = self._txflow_bbo()
@@ -960,6 +976,11 @@ class XVenueHedge:
         perpl_is_buy = not dir_buy
         pp_filled, pp_open_px, _ = self._perpl_maker_lead(self.lead_leg, perpl_is_buy, size_lead)
         if not pp_filled:
+            # ★見送り行にも腕を残す。約定率は 完走/(完走+見送り) なので、**見送りを腕別に
+            #   数えられないと分母が作れない**(台帳には完走しか載らない)。
+            _lab = getattr(self, "_ln_ab", None)
+            if _lab is not None:
+                log(f"cycle見送り(ab=${_lab:.0f})")
             return {"skip": "perpl_lead_no_fill"}   # 建玉なし=安全に見送り
 
         # perpl約定=裸perpl。txflow FOLLOWSでヘッジ。【hybrid: 短時間maker試行→taker】(2026-07-24)。
@@ -1476,6 +1497,8 @@ class XVenueHedge:
             row["join_offset_ab"] = joff_used
         if getattr(self, "_tk_ab", None) is not None:
             row["hedge_taker_ab"] = self._tk_ab
+        if getattr(self, "_ln_ab", None) is not None:
+            row["lead_notional_ab"] = self._ln_ab
         return row
 
     def _write_status(self) -> Optional[float]:

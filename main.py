@@ -627,6 +627,10 @@ class XVenueHedge:
                         log(f"⚠️ {leg.name} 指値を置けなかった(size={size} px={px}) "
                             f"→ {plt:.0f}s まで再試行。連続するなら証拠金/サイズ上限を疑う")
                         place_fail_logged = True
+                        # ★失敗が続くときだけ口座を1回읽む。2026-07-29 はここが見えず、
+                        #   「余力 $66.26 vs 必要 $66.67」を突き止めるのに11時間かかった。
+                        #   失敗時限定なので通常運転では叩かない(429を作らない)。
+                        self._log_margin_state(leg, size, px)
                     time.sleep(poll)
                     continue
             # 約定検知は常駐口座WS(handshake不要)を主に。取れない/古いときだけ従来の
@@ -776,6 +780,7 @@ class XVenueHedge:
                         self._perpl_unwind(leg, pos.get("sd") == 1, sz)  # sd==1(long)→sellで畳む
             except Exception as e:
                 log(f"⚠️ startup_reconcile {leg.name} 建玉確認失敗={repr(e)[:50]}")
+        self._sweep_retired_perpl_positions()
         try:  # txflow BTC 注文取消
             for o in (self.tx.get_open_orders(self.tx.main_address) or []):
                 if str(o.get("coin", "")).split("-")[0].upper() == self.symbol:
@@ -792,6 +797,74 @@ class XVenueHedge:
                 log(f"startup_reconcile: txflow {abs(pos)} をフラット化")
         except Exception as e:
             log(f"⚠️ startup_reconcile txflow失敗={repr(e)[:50]}")
+
+    def _log_margin_state(self, leg: "_PerplLeg", size: float, px: Optional[float]) -> None:
+        """発注できなかったときに **なぜか** を1行で残す(2026-07-29)。fail-open。
+
+        ★`_margin_cap` は equity から名目を導くが、発注を止めるのは **余力(balance)** =
+          equity − 他の建玉が握っている証拠金。孤児建玉が1本あるだけで前提が崩れる。
+          その差は口座を読まないと分からないので、失敗時だけ読む。"""
+        try:
+            snap = leg.exec._client.get_snapshot()
+            bal = float(snap.get("balance") or 0.0)
+            need = float(px or 0.0) * size / float(leg.mcfg.get("leverage", 3) or 3)
+            pos = {k: v.get("s") for k, v in (snap.get("positions") or {}).items()}
+            log(f"   余力 ${bal:,.2f} / 必要証拠金 ${need:,.2f} "
+                f"({'不足' if bal < need else '足りている'}) / 建玉 {pos or 'なし'}")
+        except Exception:
+            pass
+
+    def _sweep_retired_perpl_positions(self) -> None:
+        """**もう構築していない** perpl 脚に建玉が残っていたら畳む(2026-07-29)。
+
+        ## なぜ要るか — 実際に踏んだ形
+        `_startup_reconcile` は `self.legs` をループするが、`hedge_leg_enabled: false` に
+        すると ETH 脚は**そもそも構築されない**。上のコメントは「この関数が ETH の唯一の
+        掃除役」と書いているが、それは脚が生きている間だけ成立する。**脚を退役させた
+        瞬間に掃除役ごと消える**。
+
+        実害(2026-07-29): ヘッジ脚を切った再起動で ETH ショート 0.070 が取り残され、
+        証拠金 $44.56 を握ったまま **11時間半** 放置された。余力が $66.26 まで削られ、
+        BTC lead $200 の必要証拠金 $66.67 を **41セント** 下回って発注が通らなくなり、
+        見送り11連続・240秒バックオフで実質停止していた。
+        症状として見えたのは「約定率が低い」だけで、原因を示すものは何も出ていない。
+
+        ★[[xvenue-partial-fill-deadlock-2026-07-25]] の「ZEC 孤児建玉19時間裸(銘柄変更で
+          恒久孤児化)」と同型。**設定で脚を減らす変更は、その脚の建玉の始末を伴う。**
+
+        口座スナップショット1回で全 market の建玉を見る(脚を構築しないので板WSも張らない)。
+        fail-open: 読めなければ何もしない(掃除できないことを理由に稼働を止めない)。"""
+        if self.dry_run:
+            return
+        live_ids = {lg.market_id for lg in self.legs.values()}
+        by_id = {int(m["market_id"]): (s, m) for s, m in _PERPL_MARKETS.items()}
+        try:
+            snap = self.lead_leg.exec._client.get_snapshot()
+            positions = snap.get("positions") or {}
+        except Exception as e:
+            log(f"⚠️ 退役脚の建玉スイープ: 口座スナップショットを読めず({repr(e)[:60]})=見送り")
+            return
+        for mid_s, pos in positions.items():
+            mid = int(mid_s)
+            if mid in live_ids:
+                continue                      # 生きている脚は上のループが見る
+            if mid not in by_id:
+                log(f"⚠️ 未知の perpl market_id={mid} に建玉がある(この bot の管理外)。手動確認要")
+                continue
+            sym, mcfg = by_id[mid]
+            try:
+                sz = _pe.scaled_to_size(int(pos["s"]), int(mcfg["size_decimals"]))
+                if sz <= 1e-8:
+                    continue
+                md = _pe.PerplMarketData(f"perpl:{sym}", self.lead_leg.exec._client, dict(mcfg))
+                ex = _pe.PerplExecutor(md, self.lead_leg.exec._client)
+                was_buy = pos.get("sd") == 1                      # 1=Long → 売りで畳む
+                r = ex.place_order(not was_buy, sz, "retired_leg_cleanup", reduce_only=True)
+                px = (r or {}).get("price")
+                log(f"⚠️ 退役した perpl:{sym} の孤児建玉 {sz} を畳んだ(px={px})。"
+                    f"証拠金を握り続けて lead の発注を止める原因になる")
+            except Exception as e:
+                log(f"⚠️ 退役脚 perpl:{sym} の建玉を畳めず({repr(e)[:60]})。手動フラット化要")
 
     def _venues_flat(self) -> bool:
         """両会場の対象銘柄がフラットか(fail-closed: 読めなければFalse=フラット未確認)。

@@ -21,6 +21,11 @@ maker で約定するということは、その瞬間 価格が自分の逆へ�
 
 ★出来高/時も併記する。60秒腕はサイクル間隔が伸びるので、価格が改善しても
   出来高が落ちれば farm としては負ける。両方見て決めること。
+★★出来高/h は『腕別出来高 × 腕数』では**出せない**(2026-07-30 修正)。その式は
+  各腕が壁時計を等分する前提だが、hold 腕は 1 サイクルあたり hold 秒ぶん余計に
+  時間を食う。実際 60s 腕は $11,179/h と出ていたが、正しくは約 $9,400/h で
+  0s 腕($14,300/h)より **34% 低い** — 符号が逆に読める大きさの誤差だった。
+  正しくは「hold 以外に掛かる時間」を全腕共通と見なして単腕構成を再構成する。
 ★dir_buy 率のバランスも出す。腕が方向と交絡していたら読まない(乱択にしてあるが確認する)。
 """
 import json
@@ -62,6 +67,13 @@ def main() -> None:
         arms[float(r["hold_seconds_ab"])].append(r)
     span_h = (max(r["ts"] for r in rows) - min(r["ts"] for r in rows)) / 3600 or 1e-9
 
+    # 単腕構成の出来高/h を出すための時間分解。
+    #   窓の総秒 = Σ(hold実測) + それ以外(発注・約定待ち・見送り)
+    # 「それ以外」は乱択なので腕に依らず 1 サイクルあたり一定と見なせる。
+    span_s = span_h * 3600
+    hold_total = sum(x.get("hold_actual_s") or 0.0 for x in rows)
+    base_per_cycle = max(span_s - hold_total, 0.0) / len(rows)
+
     print(f"# hold A/B  n={len(rows)} / 窓 {span_h*60:.0f}分"
           + (f" / 直近 {hours}h" if hours else ""))
     print()
@@ -75,13 +87,17 @@ def main() -> None:
         m = st.mean(b)
         se = (st.stdev(b) / math.sqrt(len(b))) if len(b) > 1 else 0.0
         held = st.median([x.get("hold_actual_s", 0) for x in v])
-        vph = sum(x["volume_usd"] for x in v) / span_h * len(arms)
+        hold_mean = st.mean([x.get("hold_actual_s") or 0.0 for x in v])
+        cycle_s = base_per_cycle + hold_mean
+        vph = st.mean([x["volume_usd"] for x in v]) * 3600 / cycle_s
         nb = sum(1 for x in v if x.get("dir_buy"))
         stats[arm] = (m, se, len(b), st.stdev(b) if len(b) > 1 else 0.0)
         print(f"| {arm:.0f}s | {len(v)} | {held:.0f}s | {m:+.3f} ± {se:.3f} | "
               f"${vph:,.0f} | {nb/len(v)*100:.0f}% |")
     print()
-    print("★出来高/h は『この腕が単独で走ったときの推定』(窓内の腕別出来高 × 腕数)。")
+    print(f"★出来高/h は『この腕だけで走らせたときの推定』= 平均出来高/サイクル ÷ "
+          f"(hold以外 {base_per_cycle:.0f}s + その腕の平均hold)。"
+          "\n  腕別出来高×腕数では出せない(hold腕のほうが1サイクルの壁時計が長い)。")
     if len(stats) >= 2:
         a, b_ = sorted(stats)
         (ma, sa, na, sda), (mb, sb, nb_, sdb) = stats[a], stats[b_]
